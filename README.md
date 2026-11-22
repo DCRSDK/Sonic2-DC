@@ -2,7 +2,7 @@
 A Sonic 2/RSDKv4 port for SEGA Dreamcast based on the RSDKv4 Decompilation, using the mobile version as base.
 
 <!-- Placeholder: replace this URL with the Sonic 2 header image. -->
-![Sonic 2 header](https://github.com/DCRSDK/Sonic2-DC/header.jpg)
+![Sonic 2 header](https://github.com/DCRSDK/Sonic2-DC/blob/main/header.jpg)
 
 + Requires ffmpeg and Python 3 (with Pillow and NumPy) for asset generation, as well as an existing KallistiOS and mkdcdisc install for compiling the .elf and building the CDI.
 + Compatible with GCC 14.4.1 / KOS 2.3.0, or GCC 14.3.0 / KOS 2.2.2. Build with anything else at your own risk.
