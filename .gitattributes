@@ -1,0 +1,36 @@
+# Line endings. The repository stores text with LF. A Windows checkout had turned
+# ~230 files into CRLF, which made 200 unchanged files look modified and buried the
+# port's real edits under every line of each file it touched. text=auto has Git
+# normalise text to LF on commit, whatever line endings the working copy uses.
+* text=auto
+
+# LF in the working tree too, on every platform. bash and python on Linux, Colab
+# and WSL fail on CRLF ("$'\r': command not found"), and the asset kit and the
+# Colab autobuilder run exactly these.
+*.sh    text eol=lf
+*.py    text eol=lf
+
+# Binary: never converted, never diffed as text.
+*.png   binary
+*.gif   binary
+*.jpg   binary
+*.ico   binary
+*.icns  binary
+*.jar   binary
+*.dtex  binary
+*.bin   binary
+*.rsdk  binary
+*.ogg   binary
+*.wav   binary
+*.elf   binary
+*.cdi   binary
+
+# Upstream committed these seven with CRLF. Keep them byte-identical to upstream
+# instead of letting text=auto rewrite them in this repository's first commit.
+.github/workflows/build.yml                                  -text
+android/app/src/main/java/com/decomp/rsdkv4/RSDKv4.java      -text
+android/app/src/main/res/values/ic_launcher_background.xml   -text
+android/gradle/wrapper/gradle-wrapper.properties             -text
+android/gradlew.bat                                          -text
+props/winactions.props                                       -text
+props/winactions_x64.props                                   -text

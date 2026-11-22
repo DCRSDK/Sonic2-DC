@@ -291,3 +291,11 @@ android/local.properties
 .flatpak-builder
 flatpak/*.apk
 build-dir
+
+# Dreamcast build output: the ELF, plus the disc staging tree the asset kit writes
+# (converted Data/, Data.rsdk, settings.ini). Game data must never be committed.
+build-dc/
+
+# Separate dcload build directory (-DDC_DATA_ROOT=/pc/); holds a copy of Data.rsdk
+# and the converted Data/ tree just like build-dc, so it must never be committed.
+build-pc/

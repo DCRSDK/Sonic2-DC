@@ -9,6 +9,13 @@ bool engineDebugMode = false;
 #include <unistd.h>
 #endif
 
+#if RETRO_USING_KOS
+#include "Dreamcast/DCCommon.hpp"
+// Map SDL's high-resolution timer API onto KOS's nanosecond timer
+#define SDL_GetPerformanceFrequency DC_GetTicksPerSecond
+#define SDL_GetPerformanceCounter   DC_GetTicks
+#endif
+
 RetroEngine Engine = RetroEngine();
 
 #if !RETRO_USE_ORIGINAL_CODE
@@ -270,6 +277,25 @@ bool ProcessEvents()
         }
     }
 #endif
+
+#if RETRO_USING_KOS
+    // Dreamcast: the Y button opens the RSDK dev menu (stage select) when
+    // DevMenu=true in settings.ini. Mirrors the desktop ESC handler above.
+    // inputDevice[] was updated by last frame's ProcessInput; .press is the
+    // one-frame edge so it fires once per tap.
+    static bool dcDevMenuLatch = false;
+    if (Engine.devMenu && inputDevice[INPUT_BUTTONY].hold) {
+        if (!dcDevMenuLatch && Engine.gameMode != ENGINE_DEVMENU && Engine.gameMode != ENGINE_INITDEVMENU) {
+            ClearNativeObjects();
+            CREATE_ENTITY(RetroGameLoop);
+            Engine.gameMode = ENGINE_INITDEVMENU;
+        }
+        dcDevMenuLatch = true;
+    }
+    else {
+        dcDevMenuLatch = false;
+    }
+#endif
 #endif
     return true;
 }
@@ -285,7 +311,14 @@ void RetroEngine::Init()
     Engine.usingBytecode = false;
 
 #if !RETRO_USE_ORIGINAL_CODE
+#if RETRO_USING_KOS
+    DC_LOG("[DC] init: reading settings\n");
+#endif
     InitUserdata();
+#if RETRO_USING_KOS
+    DC_LOG("[DC] init: settings ok, opening data pack\n");
+    DC_Probe(2);
+#endif
 #if RETRO_USE_MOD_LOADER
     InitMods();
 #endif
@@ -317,6 +350,10 @@ void RetroEngine::Init()
     StrAdd(dest, Engine.dataFile[0]);
 #endif
     CheckRSDKFile(dest);
+#if RETRO_USING_KOS
+    DC_LOG("[DC] init: data pack '%s' -> usingDataFile=%d fileCount=%d\n", dest, Engine.usingDataFile, rsdkContainer.fileCount);
+    DC_Probe(3);
+#endif
 #else
     CheckRSDKFile("Data.rsdk");
 #endif
@@ -338,9 +375,19 @@ void RetroEngine::Init()
 #endif
     SaveGame *saveGame = (SaveGame *)saveRAM;
 
+#if RETRO_USING_KOS
+    DC_LOG("[DC] init: loading GameConfig\n");
+#endif
     if (LoadGameConfig("Data/Game/GameConfig.bin")) {
+#if RETRO_USING_KOS
+        DC_LOG("[DC] init: GameConfig ok ('%s')\n", gameWindowText);
+        DC_Probe(4);
+#endif
         if (InitRenderDevice()) {
             if (InitAudioPlayback()) {
+#if RETRO_USING_KOS
+                DC_LOG("[DC] init: audio+sfx ok, loading first stage\n");
+#endif
                 InitFirstStage();
                 ClearScriptData();
                 initialised = true;
@@ -534,8 +581,12 @@ void RetroEngine::Run()
 #if !RETRO_USE_ORIGINAL_CODE
         if (!vsync) {
             curTicks = SDL_GetPerformanceCounter();
-            if (curTicks < prevTicks + targetFreq)
+            if (curTicks < prevTicks + targetFreq) {
+#if RETRO_USING_KOS
+                thd_pass(); // yield to the audio thread while we wait
+#endif
                 continue;
+            }
             prevTicks = curTicks;
         }
 

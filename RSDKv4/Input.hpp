@@ -77,6 +77,22 @@ extern int hapticEffectNum;
 extern InputButton inputDevice[INPUT_BUTTONCOUNT];
 extern int inputType;
 
+// ---- second local player ------------------------------------------------
+// A parallel device, deliberately kept SEPARATE from inputDevice[] so every
+// existing reader - the 2013 menu especially - still sees exactly one
+// controller and behaves as it always has. Only two things consume this:
+// ProcessObjectControl() for an entity whose controlMode is CONTROLMODE_P2,
+// and the keyDown[2] / keyPress[2] script variables that Sonic 2's
+// Player2Object polls to notice a human taking Tails over.
+//
+// keyDownP2 / keyPressP2 are refreshed once per frame in ProcessInput().
+// P1's equivalents are refreshed by the scripts themselves (CheckKeyDown),
+// and nothing does that for P2, so the engine has to.
+extern InputButton inputDeviceP2[INPUT_BUTTONCOUNT];
+extern InputData keyDownP2;
+extern InputData keyPressP2;
+extern bool inputP2Connected; // is a second controller physically present
+
 extern float LSTICK_DEADZONE;
 extern float RSTICK_DEADZONE;
 extern float LTRIGGER_DEADZONE;

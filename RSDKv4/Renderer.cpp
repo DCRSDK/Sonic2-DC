@@ -3,6 +3,36 @@
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 
+#if RETRO_USING_KOS
+#include "Dreamcast/DCNative.hpp"
+
+// Meshes and stage sfx are the port's two big heap tenants and between them they
+// want more than there is. Scene.cpp frees the menu's models at the top of each
+// stage load so the sfx arena can have that space, and ReleaseStageSfx gives the
+// arena back on the way out of a stage so the models can have it again. That
+// hand-off covers the normal path, but it depends on the engine passing through
+// those points in the expected order — so LoadMesh keeps a backstop of its own.
+// If a mesh allocation fails outright, take the arena back by force and try once
+// more: silent stage sfx for the rest of a stage is a far better failure than a
+// menu drawing BIOS ROM as geometry, which is what the unchecked mallocs here
+// used to produce (address 0 on DC is ROM — writes vanish, reads succeed).
+static void *dcMeshAlloc(size_t bytes, const char *what, const char *filePath)
+{
+    void *p = malloc(bytes);
+    if (p)
+        return p;
+
+    if (DC_SfxArenaEmergencyRelease()) {
+        p = malloc(bytes);
+        PrintLog("LoadMesh: reclaimed the stage-sfx arena for %s in '%s' - %s", what, filePath, p ? "it fits now" : "still short");
+    }
+    return p;
+}
+#define RETRO_MESH_ALLOC(bytes, what, path) dcMeshAlloc((size_t)(bytes), (what), (path))
+#else
+#define RETRO_MESH_ALLOC(bytes, what, path) malloc((size_t)(bytes))
+#endif
+
 float retroVertexList[40];
 float screenBufferVertexList[40];
 
@@ -16,6 +46,30 @@ byte vertexB = 0xFF;
 
 TextureInfo textureList[TEXTURE_COUNT];
 MeshInfo meshList[MESH_COUNT];
+
+#if RETRO_USING_KOS
+// Dreamcast: a stage load evicts the native menu's model payloads but leaves the
+// slots themselves alone (see EvictMeshData below for why that distinction is
+// the whole point). These three run alongside meshList and hold what an evicted
+// slot needs in order to become itself again.
+static bool meshEvicted[MESH_COUNT];   // payload freed, slot still spoken for
+static bool meshNoReload[MESH_COUNT];  // a refill failed - stop asking the disc
+static uint meshEvictColor[MESH_COUNT]; // the vertex colour it was wearing (RGBA)
+
+// Refills granted per frame on the lazy path. The texture side allows four; two
+// is right here because a model is a much larger read than a tile texture and
+// there are only a handful of them - the menu's fade-in covers the couple of
+// frames it takes for all of them to come back.
+#define DC_MESH_RELOAD_PER_FRAME (2)
+static int meshReloadBudget = DC_MESH_RELOAD_PER_FRAME;
+
+static inline int MeshSlotOf(const MeshInfo *mesh)
+{
+    if (mesh < &meshList[0] || mesh >= &meshList[MESH_COUNT])
+        return -1;
+    return (int)(mesh - &meshList[0]);
+}
+#endif
 
 int renderStateCount = 0;
 RenderState renderStateList[RENDERSTATE_COUNT];
@@ -298,6 +352,11 @@ void SetPerspectiveMatrix(float w, float h, float near, float far)
     m[14]     = -((far + far) * near) / (far - near);
 #if RETRO_USING_OPENGL
     glMultMatrixf(m);
+#endif
+#if RETRO_USING_KOS
+    // No GL matrix stack on DC — hand the projection to the PVR native
+    // renderer's software vertex pipeline (see DCNative.cpp).
+    DC_NativeSetProjection(m);
 #endif
 }
 void SetupDrawIndexList()
@@ -590,6 +649,32 @@ int LoadTexture(const char *filePath, int format)
     if (texID == TEXTURE_COUNT)
         return 0;
 
+#if RETRO_USING_KOS
+    // Prefer a pre-converted native PVR texture (tools/dtex_convert.py) streamed
+    // straight to VRAM. stbi_load OOMs on the DC heap for images bigger than
+    // ~256x256, so most menu/model PNGs never decoded — the .dtex path avoids
+    // decoding entirely. Falls through to stbi if no .dtex is present.
+    {
+        int dw = 0, dh = 0;
+        if (DC_NativeTryLoadDtex(texID, filePath, &dw, &dh)) {
+            TextureInfo *texture = &textureList[texID];
+            texture->width       = dw;
+            texture->height      = dh;
+            texture->format      = format;
+            StrCopy(texture->fileName, filePath);
+            float normalize = 1.0;
+            if (FindStringToken(filePath, "@2", 1) > 0)
+                normalize = 2.0;
+            else if (FindStringToken(filePath, "@1", 1) > 0)
+                normalize = 0.5;
+            texture->widthN  = normalize / dw;
+            texture->heightN = normalize / dh;
+            texture->id      = (uint)texID;
+            return texID;
+        }
+    }
+#endif
+
     FileInfo info;
     if (LoadFile(filePath, &info)) {
 
@@ -625,6 +710,14 @@ int LoadTexture(const char *filePath, int format)
             glBindTexture(GL_TEXTURE_2D, texture->id);
 #endif
 
+            // The per-format pixel conversion below exists only to feed
+            // glTexImage2D. On the Dreamcast (no GL) it is pure waste — it
+            // malloc's a full-size buffer, converts, and frees it, fragmenting
+            // the heap right before the next stbi_load and starving it of the
+            // contiguous RAM it needs to decode. That silently dropped most menu
+            // textures. Skip it entirely on DC; the KOS hook below uploads to
+            // the PVR straight from stb's raw `data`.
+#if RETRO_USING_OPENGL
             int id = 0;
             switch (format) {
                 default: break;
@@ -698,6 +791,15 @@ int LoadTexture(const char *filePath, int format)
                     break;
                 }
             }
+#endif // RETRO_USING_OPENGL
+
+#if RETRO_USING_KOS
+            // Mirror this menu texture into PVR VRAM and key it by texID so the
+            // native renderer can bind it. On DC the GL `id` is unused, so we
+            // repurpose it to carry texID into the render state list.
+            texture->id = (uint)texID;
+            DC_NativeUploadTexture(texID, data, width, height, format);
+#endif
         }
 
         CloseFile();
@@ -823,12 +925,395 @@ void ClearTextures(bool keepBuffer)
 }
 
 // Meshes
+//
+// The mesh format is fixed and entirely self-describing, which makes a file's
+// own length a checksum on the three counts inside it:
+//
+//     4                        magic, "R3D\0"
+//     2                        vertexCount, V
+//     V * 8                    texture coords, two floats per vertex
+//     2                        indexCount, I
+//     I * 6                    three ushorts per triangle
+//     2                        frameCount, F
+//     (F > 1 ? F * V : V) * 24 position + normal per vertex, per frame
+//
+// That holds exactly for every model Sonic 2 ships - 2PVS.bin 16954,
+// Achievements.bin 24058, BackArrow.bin 1930, Leaderboards.bin 17858,
+// Options.bin 5850, TimeAttack.bin 72326 - so the counts can be checked against
+// the file before a single byte is allocated for them.
+//
+// This is worth doing because a bad read used to sail straight through here. A
+// contended GD-ROM read handed back a partly filled buffer, the datapack's
+// decryption keystream carried on regardless, and the counts came out as
+// plausible nonsense: 255 frames for a 24 KB Achievements.bin, 30248 indices for
+// a 5.8 KB Options.bin. Each then asked malloc for several megabytes, got NULL,
+// and - because address 0 on the Dreamcast is BIOS ROM, where writes vanish and
+// reads succeed - the 2013 menu quietly drew ROM contents as geometry, with no
+// crash and nothing in the log but an out-of-memory line for a size that could
+// never have been real.
+//
+// FillFileBuffer no longer ignores short reads (see Reader.hpp), so the counts
+// should be right now. The checks stay regardless: they cost a few multiplies,
+// they turn any future flavour of bad read into a retry and a log line rather
+// than a corrupted menu, and they guarantee no allocation is ever sized from a
+// number the file itself contradicts.
+
+enum MeshReadResult {
+    MESH_READ_OK      = 0, // loaded
+    MESH_READ_MISSING = 1, // not there, or not a mesh - asking again won't help
+    MESH_READ_NOMEM   = 2, // the counts were believable, the memory just wasn't there
+    MESH_READ_BADDATA = 3, // the counts contradict the file's length - bad read, retry
+};
+
+// Releases a slot's geometry and leaves the counts at zero, but says nothing
+// about WHICH mesh the slot belongs to - fileName and textureID are untouched.
+// Safe to call twice: the pointers are nulled as they go.
+static void FreeMeshPayload(MeshInfo *mesh)
+{
+    if (mesh->vertices)
+        free(mesh->vertices);
+    if (mesh->indices)
+        free(mesh->indices);
+    if (mesh->frames)
+        free(mesh->frames);
+
+    mesh->vertices    = NULL;
+    mesh->indices     = NULL;
+    mesh->frames      = NULL;
+    mesh->vertexCount = 0;
+    mesh->indexCount  = 0;
+    mesh->frameCount  = 0;
+}
+
+// Releases whatever a half-finished load managed to allocate and puts the slot
+// back to empty - identity included, so the next LoadMesh may claim it for a
+// different file.
+static void ClearMeshSlot(MeshInfo *mesh)
+{
+    FreeMeshPayload(mesh);
+    StrCopy(mesh->fileName, "");
+
+#if RETRO_USING_KOS
+    const int slot = MeshSlotOf(mesh);
+    if (slot >= 0) {
+        meshEvicted[slot]    = false;
+        meshNoReload[slot]   = false;
+        meshEvictColor[slot] = 0xFFFFFFFF;
+    }
+#endif
+}
+
+// One attempt at reading a mesh off the disc into an empty slot. On anything
+// other than MESH_READ_OK the caller clears the slot; nothing is freed in here.
+static int ReadMeshFile(MeshInfo *mesh, const char *filePath, byte textureID, bool lastAttempt)
+{
+    // The slot is empty by contract, so null rather than free - a slot that has
+    // been through ClearMeshSlot (or ClearMeshData) holds no live pointers.
+    mesh->vertices    = NULL;
+    mesh->indices     = NULL;
+    mesh->frames      = NULL;
+    mesh->vertexCount = 0;
+    mesh->indexCount  = 0;
+    mesh->frameCount  = 0;
+
+    FileInfo info;
+    if (!LoadFile(filePath, &info))
+        return MESH_READ_MISSING;
+
+    byte buffer[4];
+    FileRead(buffer, 4 * sizeof(byte));
+    if (buffer[0] != 'R' || buffer[1] != '3' || buffer[2] != 'D' || buffer[3] != '\0') {
+        CloseFile();
+        return MESH_READ_MISSING;
+    }
+
+    // vfileSize is the mesh's own length in both of LoadFile's paths: the entry
+    // size for a file inside Data.rsdk, the file's own size for a loose one.
+    // (fileSize, by contrast, is the whole datapack for a packed file.)
+    const long long fileBytes = (long long)info.vfileSize;
+
+    StrCopy(mesh->fileName, filePath);
+    mesh->textureID = textureID;
+
+    FileRead(buffer, sizeof(ushort));
+    mesh->vertexCount = buffer[0] + (buffer[1] << 8);
+
+    long long need = 4 + 2 + (long long)mesh->vertexCount * 8 + 2;
+    if (need > fileBytes) {
+        PrintLog("LoadMesh: '%s' claims %d vertices, needing %d bytes of a %d byte file - bad read", filePath, mesh->vertexCount, (int)need,
+                 (int)fileBytes);
+        CloseFile();
+        return MESH_READ_BADDATA;
+    }
+
+    mesh->vertices = (DrawVertex *)RETRO_MESH_ALLOC(sizeof(DrawVertex) * mesh->vertexCount, "vertices", filePath);
+    if (mesh->vertexCount && !mesh->vertices) {
+        PrintLog("LoadMesh: OUT OF MEMORY for %d vertices (%d bytes) in '%s'", mesh->vertexCount, (int)(sizeof(DrawVertex) * mesh->vertexCount),
+                 filePath);
+        CloseFile();
+        return MESH_READ_NOMEM;
+    }
+
+    for (int v = 0; v < mesh->vertexCount; ++v) {
+        float buf = 0;
+        FileRead(&buf, sizeof(float));
+        mesh->vertices[v].texCoordX = buf;
+
+        FileRead(&buf, sizeof(float));
+        mesh->vertices[v].texCoordY = buf;
+
+        mesh->vertices[v].r = 0xFF;
+        mesh->vertices[v].g = 0xFF;
+        mesh->vertices[v].b = 0xFF;
+        mesh->vertices[v].a = 0xFF;
+    }
+
+    FileRead(buffer, sizeof(ushort));
+    mesh->indexCount = buffer[0] + (buffer[1] << 8);
+
+    need += (long long)mesh->indexCount * 6 + 2;
+    if (need > fileBytes) {
+        PrintLog("LoadMesh: '%s' claims %d triangles, needing %d bytes of a %d byte file - bad read", filePath, mesh->indexCount, (int)need,
+                 (int)fileBytes);
+        CloseFile();
+        return MESH_READ_BADDATA;
+    }
+
+    mesh->indices = (ushort *)RETRO_MESH_ALLOC(sizeof(ushort) * (3 * mesh->indexCount), "indices", filePath);
+    if (mesh->indexCount && !mesh->indices) {
+        PrintLog("LoadMesh: OUT OF MEMORY for %d indices (%d bytes) in '%s'", 3 * mesh->indexCount,
+                 (int)(sizeof(ushort) * (3 * mesh->indexCount)), filePath);
+        CloseFile();
+        return MESH_READ_NOMEM;
+    }
+
+    int id = 0;
+    for (int i = 0; i < mesh->indexCount; ++i) {
+        FileRead(buffer, sizeof(ushort));
+        mesh->indices[id + 2] = buffer[0] + (buffer[1] << 8);
+
+        FileRead(buffer, sizeof(ushort));
+        mesh->indices[id + 1] = buffer[0] + (buffer[1] << 8);
+
+        FileRead(buffer, sizeof(ushort));
+        mesh->indices[id + 0] = buffer[0] + (buffer[1] << 8);
+
+        id += 3;
+    }
+
+    FileRead(buffer, sizeof(ushort));
+    mesh->frameCount = buffer[0] + (buffer[1] << 8);
+
+    // The vertex payload is the rest of the file, so this last check is the
+    // strict one: the arithmetic should land exactly on the file's length.
+    const long long total = need + (mesh->frameCount > 1 ? (long long)mesh->frameCount * mesh->vertexCount * 24 : (long long)mesh->vertexCount * 24);
+    if (total > fileBytes) {
+        PrintLog("LoadMesh: '%s' claims %d frames of %d verts, needing %d bytes of a %d byte file - bad read", filePath, mesh->frameCount,
+                 mesh->vertexCount, (int)total, (int)fileBytes);
+        CloseFile();
+        return MESH_READ_BADDATA;
+    }
+    if (total != fileBytes && !lastAttempt) {
+        // Fits, but leaves bytes unaccounted for - suspicious rather than fatal,
+        // so it is worth another read. The last attempt takes it as it comes.
+        PrintLog("LoadMesh: '%s' accounts for %d of %d bytes - reading it again", filePath, (int)total, (int)fileBytes);
+        CloseFile();
+        return MESH_READ_BADDATA;
+    }
+
+    if (mesh->frameCount <= 1) {
+        for (int v = 0; v < mesh->vertexCount; ++v) {
+            float buf = 0;
+            FileRead(&buf, sizeof(float));
+            mesh->vertices[v].vertX = buf;
+
+            FileRead(&buf, sizeof(float));
+            mesh->vertices[v].vertY = buf;
+
+            FileRead(&buf, sizeof(float));
+            mesh->vertices[v].vertZ = buf;
+
+            FileRead(&buf, sizeof(float));
+            mesh->vertices[v].normalX = buf;
+
+            FileRead(&buf, sizeof(float));
+            mesh->vertices[v].normalY = buf;
+
+            FileRead(&buf, sizeof(float));
+            mesh->vertices[v].normalZ = buf;
+        }
+    }
+    else {
+        mesh->frames = (MeshVertex *)RETRO_MESH_ALLOC(mesh->frameCount * mesh->vertexCount * sizeof(MeshVertex), "frames", filePath);
+
+        if (!mesh->frames) {
+            PrintLog("LoadMesh: OUT OF MEMORY for %d frames x %d verts (%d bytes) in '%s'", mesh->frameCount, mesh->vertexCount,
+                     (int)(mesh->frameCount * mesh->vertexCount * sizeof(MeshVertex)), filePath);
+            CloseFile();
+            return MESH_READ_NOMEM;
+        }
+
+        for (int f = 0; f < mesh->frameCount; ++f) {
+            int frameOff = (f * mesh->vertexCount);
+            for (int v = 0; v < mesh->vertexCount; ++v) {
+                float buf = 0;
+                FileRead(&buf, sizeof(float));
+                mesh->frames[frameOff + v].vertX = buf;
+
+                FileRead(&buf, sizeof(float));
+                mesh->frames[frameOff + v].vertY = buf;
+
+                FileRead(&buf, sizeof(float));
+                mesh->frames[frameOff + v].vertZ = buf;
+
+                FileRead(&buf, sizeof(float));
+                mesh->frames[frameOff + v].normalX = buf;
+
+                FileRead(&buf, sizeof(float));
+                mesh->frames[frameOff + v].normalY = buf;
+
+                FileRead(&buf, sizeof(float));
+                mesh->frames[frameOff + v].normalZ = buf;
+            }
+        }
+    }
+
+    CloseFile();
+    return MESH_READ_OK;
+}
+
+#if RETRO_USING_KOS
+// Reads an evicted slot's geometry back off the disc, IN PLACE. The slot index
+// must not move: entities that came back through RestoreNativeObjects still
+// hold a MeshInfo* straight into this array, so the mesh has to reappear at the
+// address they are already pointing at.
+//
+// A refill that fails keeps the slot's NAME (so no other file can take it out
+// from under those pointers) and marks it, so a menu that is missing a model
+// costs one failed read rather than one per frame forever.
+static bool RefillMeshSlot(MeshInfo *mesh)
+{
+    const int slot = MeshSlotOf(mesh);
+    if (slot < 0 || meshNoReload[slot] || !StrLength(mesh->fileName))
+        return false;
+
+    char filePath[0x40];
+    StrCopy(filePath, mesh->fileName);
+    const byte textureID = mesh->textureID;
+
+    const int attempts = 3;
+    for (int attempt = 1; attempt <= attempts; ++attempt) {
+        int result = ReadMeshFile(mesh, filePath, textureID, attempt == attempts);
+
+        if (result == MESH_READ_OK) {
+            meshEvicted[slot] = false;
+
+            // Vertex colours are set once, in the owning object's Create event -
+            // MenuBG tints its circles 0xE0D0C0, SubMenuButton tints its buttons.
+            // Coming back from a stage no Create event runs, so a slot that was
+            // refilled straight off the disc would come back plain white. Put
+            // back whatever it was wearing when it was evicted.
+            const uint c = meshEvictColor[slot];
+            SetMeshVertexColors(mesh, (byte)(c >> 24), (byte)(c >> 16), (byte)(c >> 8), (byte)c);
+
+            // An animated mesh keeps its geometry in frames[]; vertices[] only
+            // receives positions when AnimateMesh interpolates a pair of them,
+            // which happens after this. Seed it from frame 0 so the first frame
+            // back does not draw whatever malloc happened to hand over.
+            if (mesh->frameCount > 1 && mesh->frames && mesh->vertices) {
+                for (int v = 0; v < mesh->vertexCount; ++v) {
+                    mesh->vertices[v].vertX   = mesh->frames[v].vertX;
+                    mesh->vertices[v].vertY   = mesh->frames[v].vertY;
+                    mesh->vertices[v].vertZ   = mesh->frames[v].vertZ;
+                    mesh->vertices[v].normalX = mesh->frames[v].normalX;
+                    mesh->vertices[v].normalY = mesh->frames[v].normalY;
+                    mesh->vertices[v].normalZ = mesh->frames[v].normalZ;
+                }
+            }
+            return true;
+        }
+
+        // Note FreeMeshPayload, not ClearMeshSlot: the slot keeps its identity
+        // even across a failed read.
+        FreeMeshPayload(mesh);
+        StrCopy(mesh->fileName, filePath);
+        mesh->textureID = textureID;
+
+        if (result != MESH_READ_BADDATA)
+            break;
+
+        if (attempt < attempts)
+            PrintLog("LoadMesh: re-reading '%s', attempt %d of %d", filePath, attempt + 1, attempts);
+    }
+
+    PrintLog("LoadMesh: could not restore '%s' after a stage load - it will not be drawn", filePath);
+    meshNoReload[slot] = true;
+    return false;
+}
+
+// Dreamcast stage load. Frees the native menu's model geometry - some 620KB
+// between Intro, JPBox, the carousel icons and the rest - while KEEPING every
+// slot's fileName and textureID.
+//
+// That distinction is the entire fix. This used to call ClearMeshData(), on the
+// argument that meshList is a static array so a MeshInfo* held by a native
+// entity stays a valid pointer, an emptied slot draws nothing, and LoadMesh
+// refills it when the menu comes back. The first two are true. The third is
+// where it fell apart: ClearMeshSlot wipes fileName, and LoadMesh allocates by
+// scanning from slot 0 to the first nameless one. So after a stage the pause
+// menu's own Create events - BGCircle1, BGCircle2, BGLines, Button, ButtonH,
+// Panel - refilled the list from 0 up in THEIR request order, which is not the
+// order the main menu had built. Exiting to the main menu then ran
+// RestoreNativeObjects(), a raw memcpy of the entity bank with no Create events,
+// so those entities came back holding their ORIGINAL pointers: MenuBG's
+// bgCircle1 still pointed at slot 3, which by then held Button.bin. The menu
+// came back drawing buttons where its background circles belong and its line
+// mesh through a cartridge's transform.
+//
+// This is the same trap DC_NativeResetTextures already documents on the texture
+// side, and the same answer: free the payload, keep the bookkeeping, and let the
+// slot be filled back in - at the same index - when something asks to draw it.
+void EvictMeshData()
+{
+    for (int i = 0; i < MESH_COUNT; ++i) {
+        MeshInfo *mesh = &meshList[i];
+        if (!StrLength(mesh->fileName) || meshEvicted[i])
+            continue;
+
+        uint c = 0xFFFFFFFF;
+        if (mesh->vertexCount && mesh->vertices)
+            c = ((uint)mesh->vertices[0].r << 24) | ((uint)mesh->vertices[0].g << 16) | ((uint)mesh->vertices[0].b << 8) | (uint)mesh->vertices[0].a;
+
+        meshEvictColor[i] = c;
+        meshEvicted[i]    = true;
+        meshNoReload[i]   = false;
+
+        FreeMeshPayload(mesh);
+    }
+}
+
+// Once per frame, from the DC flip - alongside DC_NativeReloadEvicted, which
+// does the same job for textures. Everything the menu draws gets its geometry
+// back within a few frames of being asked for, without a stage load's worth of
+// reads landing on one of them.
+void ResetEvictedMeshBudget() { meshReloadBudget = DC_MESH_RELOAD_PER_FRAME; }
+#endif
+
 MeshInfo *LoadMesh(const char *filePath, byte textureID)
 {
     int meshID = 0;
     for (int i = 0; i < MESH_COUNT; ++i) {
-        if (StrComp(meshList[meshID].fileName, filePath) && meshList[meshID].textureID == textureID)
+        if (StrComp(meshList[meshID].fileName, filePath) && meshList[meshID].textureID == textureID) {
+#if RETRO_USING_KOS
+            // Right slot, no geometry: a stage load evicted it. Fill it back in
+            // here rather than handing back an empty mesh - this is the path the
+            // pause menu takes, and it must land in THIS slot, not a fresh one.
+            // Not budgeted: an explicit LoadMesh is a demand load.
+            if (meshEvicted[meshID])
+                RefillMeshSlot(&meshList[meshID]);
+#endif
             return &meshList[meshID];
+        }
         if (!StrLength(meshList[meshID].fileName))
             break;
         meshID++;
@@ -836,131 +1321,44 @@ MeshInfo *LoadMesh(const char *filePath, byte textureID)
     if (meshID == MESH_COUNT)
         return 0;
 
-    FileInfo info;
-    if (LoadFile(filePath, &info)) {
-        byte buffer[4];
-        FileRead(buffer, 4 * sizeof(byte));
-        if (buffer[0] == 'R' && buffer[1] == '3' && buffer[2] == 'D' && buffer[3] == '\0') {
-            MeshInfo *mesh = &meshList[meshID];
+    MeshInfo *mesh = &meshList[meshID];
 
-            StrCopy(mesh->fileName, filePath);
-            mesh->textureID = textureID;
+#if RETRO_USING_KOS
+    // A fresh claim on an empty slot: nothing about a previous tenant applies.
+    meshEvicted[meshID]    = false;
+    meshNoReload[meshID]   = false;
+    meshEvictColor[meshID] = 0xFFFFFFFF;
+#endif
 
-            FileRead(buffer, sizeof(ushort));
-            mesh->vertexCount = buffer[0] + (buffer[1] << 8);
-            mesh->vertices    = (DrawVertex *)malloc(sizeof(DrawVertex) * mesh->vertexCount);
-
-            for (int v = 0; v < mesh->vertexCount; ++v) {
-                float buf = 0;
-                FileRead(&buf, sizeof(float));
-                mesh->vertices[v].texCoordX = buf;
-
-                FileRead(&buf, sizeof(float));
-                mesh->vertices[v].texCoordY = buf;
-
-                mesh->vertices[v].r = 0xFF;
-                mesh->vertices[v].g = 0xFF;
-                mesh->vertices[v].b = 0xFF;
-                mesh->vertices[v].a = 0xFF;
-            }
-
-            FileRead(buffer, sizeof(ushort));
-            mesh->indexCount = buffer[0] + (buffer[1] << 8);
-            mesh->indices    = (ushort *)malloc(sizeof(ushort) * (3 * mesh->indexCount));
-
-            int id = 0;
-            for (int i = 0; i < mesh->indexCount; ++i) {
-                FileRead(buffer, sizeof(ushort));
-                mesh->indices[id + 2] = buffer[0] + (buffer[1] << 8);
-
-                FileRead(buffer, sizeof(ushort));
-                mesh->indices[id + 1] = buffer[0] + (buffer[1] << 8);
-
-                FileRead(buffer, sizeof(ushort));
-                mesh->indices[id + 0] = buffer[0] + (buffer[1] << 8);
-
-                id += 3;
-            }
-
-            FileRead(buffer, sizeof(ushort));
-            mesh->frameCount = buffer[0] + (buffer[1] << 8);
-
-            if (mesh->frameCount <= 1) {
-                for (int v = 0; v < mesh->vertexCount; ++v) {
-                    float buf = 0;
-                    FileRead(&buf, sizeof(float));
-                    mesh->vertices[v].vertX = buf;
-
-                    FileRead(&buf, sizeof(float));
-                    mesh->vertices[v].vertY = buf;
-
-                    FileRead(&buf, sizeof(float));
-                    mesh->vertices[v].vertZ = buf;
-
-                    FileRead(&buf, sizeof(float));
-                    mesh->vertices[v].normalX = buf;
-
-                    FileRead(&buf, sizeof(float));
-                    mesh->vertices[v].normalY = buf;
-
-                    FileRead(&buf, sizeof(float));
-                    mesh->vertices[v].normalZ = buf;
-                }
-            }
-            else {
-                mesh->frames = (MeshVertex *)malloc(mesh->frameCount * mesh->vertexCount * sizeof(MeshVertex));
-                for (int f = 0; f < mesh->frameCount; ++f) {
-                    int frameOff = (f * mesh->vertexCount);
-                    for (int v = 0; v < mesh->vertexCount; ++v) {
-                        float buf = 0;
-                        FileRead(&buf, sizeof(float));
-                        mesh->frames[frameOff + v].vertX = buf;
-
-                        FileRead(&buf, sizeof(float));
-                        mesh->frames[frameOff + v].vertY = buf;
-
-                        FileRead(&buf, sizeof(float));
-                        mesh->frames[frameOff + v].vertZ = buf;
-
-                        FileRead(&buf, sizeof(float));
-                        mesh->frames[frameOff + v].normalX = buf;
-
-                        FileRead(&buf, sizeof(float));
-                        mesh->frames[frameOff + v].normalY = buf;
-
-                        FileRead(&buf, sizeof(float));
-                        mesh->frames[frameOff + v].normalZ = buf;
-                    }
-                }
-            }
-            CloseFile();
-
+    // Three goes at it. A read that comes back wrong is a timing accident - the
+    // disc is being read from two threads - so asking again usually gets the
+    // real bytes, and a mesh that loads on the second try is worth far more than
+    // a menu built out of null pointers.
+    const int attempts = 3;
+    for (int attempt = 1; attempt <= attempts; ++attempt) {
+        int result = ReadMeshFile(mesh, filePath, textureID, attempt == attempts);
+        if (result == MESH_READ_OK)
             return mesh;
-        }
-        else {
-            CloseFile();
-        }
+
+        ClearMeshSlot(mesh);
+
+        // Missing, not a mesh, or genuinely short of memory: nothing a retry fixes.
+        if (result != MESH_READ_BADDATA)
+            return NULL;
+
+        if (attempt < attempts)
+            PrintLog("LoadMesh: re-reading '%s', attempt %d of %d", filePath, attempt + 1, attempts);
     }
+
+    PrintLog("LoadMesh: gave up on '%s' after %d attempts", filePath, attempts);
     return NULL;
 }
 void ClearMeshData()
 {
     for (int i = 0; i < MESH_COUNT; ++i) {
         MeshInfo *mesh = &meshList[i];
-        if (StrLength(mesh->fileName)) {
-            if (mesh->frameCount > 1)
-                free(mesh->frames);
-            if (mesh->indexCount)
-                free(mesh->indices);
-            if (mesh->vertexCount)
-                free(mesh->vertices);
-
-            mesh->frameCount  = 0;
-            mesh->indexCount  = 0;
-            mesh->vertexCount = 0;
-
-            StrCopy(meshList[i].fileName, "");
-        }
+        if (StrLength(mesh->fileName))
+            ClearMeshSlot(mesh);
     }
 }
 void SetMeshAnimation(MeshInfo *mesh, MeshAnimator *animator, ushort frameID, ushort frameCount, float speed)
@@ -1790,6 +2188,24 @@ void RenderMesh(MeshInfo *mesh, byte type, byte depthTest)
 {
     if (!mesh)
         return;
+
+#if RETRO_USING_KOS
+    // The lazy half of the eviction (EvictMeshData). Entities restored from the
+    // backup bank never run a Create event, so they never call LoadMesh again -
+    // asking to be drawn is the only signal a model gives that it is wanted, and
+    // it is a good one: the models the menu does not draw stay evicted and the
+    // heap keeps most of what the eviction won.
+    //
+    // Safe to read the disc from here: native objects build their render states
+    // during the game loop, well before the PVR scene is opened.
+    if (meshReloadBudget > 0) {
+        const int slot = MeshSlotOf(mesh);
+        if (slot >= 0 && meshEvicted[slot]) {
+            --meshReloadBudget;
+            RefillMeshSlot(mesh);
+        }
+    }
+#endif
 
     if (renderStateCount < RENDERSTATE_COUNT) {
         if (currentRenderState.indexCount) {

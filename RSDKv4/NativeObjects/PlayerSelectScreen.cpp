@@ -1,4 +1,7 @@
 #include "RetroEngine.hpp"
+#if RETRO_USING_KOS
+#include "Dreamcast/DCSave.hpp"
+#endif
 
 void PlayerSelectScreen_Create(void *objPtr)
 {
@@ -213,6 +216,9 @@ void PlayerSelectScreen_Main(void *objPtr)
                     saveGame->files[saveSel->selectedButton - 1].emeralds       = 0;
                     saveGame->files[saveSel->selectedButton - 1].specialStageID = 0;
                     WriteSaveRAMData();
+#if RETRO_USING_KOS
+                    DC_FlushSaves(); // menu-side write - see SettingsScreen.cpp for why
+#endif
                 }
                 SetGlobalVariableByName("options.stageSelectFlag", 0);
                 SetGlobalVariableByName("player.lives", 3);

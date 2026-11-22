@@ -1,4 +1,7 @@
 #include "RetroEngine.hpp"
+#if RETRO_USING_KOS
+#include "Dreamcast/DCSave.hpp"
+#endif
 
 void SettingsScreen_Create(void *objPtr)
 {
@@ -746,6 +749,16 @@ void SettingsScreen_Main(void *objPtr)
                     }
                 }
                 WriteSaveRAMData();
+#if RETRO_USING_KOS
+                // Menu-side save: flush it now rather than leaving it queued. On DC
+                // WriteSaveRAMData() only raises a pending flag - DCSave.cpp defers VMU
+                // writes because the engine also asks for them mid-gameplay, where a
+                // ~300ms memory-card stall is a visible freeze. But the only two flush
+                // points are a stage load and a settled pause menu, and the 2013 menu
+                // reaches neither, so anything changed in here was lost on power-off.
+                // This is a screen transition, so the write costs nothing visible.
+                DC_FlushSaves();
+#endif
                 return;
             }
             break;

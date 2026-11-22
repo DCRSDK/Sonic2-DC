@@ -1,5 +1,21 @@
 #include "RetroEngine.hpp"
 
+#if RETRO_USING_KOS
+#include "Dreamcast/DCCommon.hpp"
+// Defined in DCGraphics.cpp (declared here rather than DCCommon.hpp to keep the
+// change to the two committed files). Arbitrary-corner flat-colour PVR quad for
+// scene3D COLORED/FADED faces — the special stage half-pipe.
+extern void DC_Queue3DColorQuad(const float *xs, const float *ys, uint argb);
+// Sprites always render as hardware quads now, INCLUDING in special stages.
+// (Earlier the special stage half-pipe was software-only because Draw3DScene
+// rasterised the pipe into the framebuffer — the backmost layer — so hardware
+// sprites buried it. Draw3DScene now queues its own PVR quads too (see the
+// KOS branches in DrawFace/DrawFadedFace/DrawTexturedFace), so the pipe, its
+// 3D-sprite rings, the diamond background and the HUD all interleave by the
+// running draw-order z. Nothing needs the software framebuffer path.)
+static inline bool DC_UseHWSprites() { return true; }
+#endif
+
 ushort blendLookupTable[0x20 * 0x100];
 ushort subtractLookupTable[0x20 * 0x100];
 ushort tintLookupTable[0x10000];
@@ -55,6 +71,11 @@ int InitRenderDevice()
     char gameTitle[0x40];
 
     sprintf(gameTitle, "%s%s", Engine.gameWindowText, Engine.usingDataFile_Config ? "" : " (Using Data Folder)");
+
+#if RETRO_USING_KOS
+    (void)gameTitle;
+    return DC_InitRenderDevice();
+#endif
 
 #if !RETRO_USE_ORIGINAL_CODE
 #if RETRO_USING_SDL2
@@ -299,6 +320,10 @@ int InitRenderDevice()
 }
 void FlipScreen()
 {
+#if RETRO_USING_KOS
+    DC_FlipScreen();
+    return;
+#endif
 #if !RETRO_USE_ORIGINAL_CODE
     float dimAmount = 1.0;
     if ((!Engine.masterPaused || Engine.frameStep) && !drawStageGFXHQ) {
@@ -524,6 +549,11 @@ void ReleaseRenderDevice(bool refresh)
         ClearTextures(false);
     }
 
+#if RETRO_USING_KOS
+    DC_ReleaseRenderDevice();
+    return;
+#endif
+
 #if !RETRO_USE_ORIGINAL_CODE
 #if RETRO_SOFTWARE_RENDER
     if (Engine.frameBuffer)
@@ -573,6 +603,15 @@ void GenerateBlendLookupTable(void)
 
 void ClearScreen(byte index)
 {
+#if RETRO_USING_KOS
+    // A script ClearScreen erases everything drawn so far this frame — and
+    // the hardware quad queue is part of "drawn so far". Without this, tile
+    // layers queued before the clear survive it (the title screen's BG text
+    // peeked out from behind the emblem: STLogo hides the BG by clearing
+    // every frame). The framebuffer fill below still runs, so the cleared
+    // colour shows through as the backdrop.
+    DC_ClearSpriteQueue();
+#endif
 #if RETRO_SOFTWARE_RENDER
     ushort color        = activePalette[index];
     ushort *framebuffer = Engine.frameBuffer;
@@ -1006,6 +1045,10 @@ void DrawObjectList(int Layer)
         }
     }
 }
+#if RETRO_USING_KOS
+static void DC_EvalLowTileHW(); // defined above DC_DrawHLineScrollLayerHW below
+#endif
+
 void DrawStageGFX()
 {
     waterDrawPos = waterLevel - yScrollOffset;
@@ -1016,6 +1059,18 @@ void DrawStageGFX()
 
     if (waterDrawPos > SCREEN_YSIZE)
         waterDrawPos = SCREEN_YSIZE;
+#endif
+
+#if RETRO_USING_KOS
+    // Decide ONCE per frame whether the low tile passes render as hardware
+    // quads or fall back to software together (exotic layer types, or a
+    // deformation too fine to band-split inside the quad budget).
+    //
+    // MUST run AFTER waterDrawPos is final: the band estimate splits at the
+    // water line and reads the two deformation tables either side of it, so
+    // a stale value would mis-count bands on the frame the water level moves
+    // and could overrun the sprite queue (dropped tiles = holes).
+    DC_EvalLowTileHW();
 #endif
 
     if (tLayerMidPoint < 3) {
@@ -1247,6 +1302,13 @@ void DrawStageGFX()
 #endif
 
 #if RETRO_SOFTWARE_RENDER
+#if RETRO_USING_KOS
+    // On DC the software fade rect would only darken the framebuffer (tiles),
+    // missing the hardware sprites. Route it to a PVR overlay that covers the
+    // whole composited scene instead (see DC_FlipScreen).
+    if (fadeMode > 0)
+        DC_SetFadeOverlay(fadeR, fadeG, fadeB, fadeA);
+#else
     if (drawStageGFXHQ) {
         CopyFrameOverlay2x();
 
@@ -1260,6 +1322,7 @@ void DrawStageGFX()
             DrawRectangle(0, 0, SCREEN_XSIZE, SCREEN_YSIZE, fadeR, fadeG, fadeB, fadeA);
         }
     }
+#endif
 #endif
 
 #if !RETRO_USE_ORIGINAL_CODE
@@ -1356,11 +1419,323 @@ void DrawDebugOverlays()
 }
 #endif
 
+#if RETRO_USING_KOS
+// P2b/P3: tile layers as hardware quads.
+// P2b moved the HIGH (visualPlane 1) pass onto the PVR so foreground tiles
+// occlude sprites. P3 generalises the same machinery to the LOW passes
+// (background layers + the FG's plane-0 tiles) — the last software
+// rasterisation, and the measured cause of Hill Top's frame drops on real
+// hardware (the perf bars showed ~20-28ms frames with the GPU idle: 77k+
+// pixels/layer/frame of SH4 palette blits).
+//
+// Per-line parallax is preserved EXACTLY by splitting the screen into bands
+// wherever the layer's lineScroll index changes (not just at tile-row
+// boundaries). Per-line DEFORMATION (water ripple) is handled the same way:
+// a band also ends wherever the deformation offset changes, and at the water
+// line (the above/below-water tables are separate). That is exact, not an
+// approximation — the same integer the software path adds to chunkX is added
+// here — but it COSTS BANDS, so DC_EvalLowTileHW counts the extra ones into
+// its quad estimate and a layer whose wobble is too fine to afford simply
+// stays software, exactly as before. A VSCROLL/3D layer is still software-
+// only and still ends the hardware suffix outright.
+//
+// Software layers must remain a BACK-most prefix (see below), so the walk is
+// all-or-nothing from the first layer that fails. The high pass stays
+// hardware regardless (a software high plane would land behind sprites —
+// the P2b bug).
+//
+// Hidden Palace is the case this exists for: it is the only zone that
+// deforms the FOREGROUND (HPZSetup calls SetLayerDeformation with
+// DEFORM_FG_WATER), and the FG's plane-0 pass is the FRONT-most low pass, so
+// the old deform bail took all three of HPZ's low passes down with it —
+// confirmed on Redream as "low tile passes: hardware from layer 3 (mid=3)".
+// Its FG wobble is amplitude 2 over a 64-line period, about 22 extra bands;
+// its BG wobble is a full period every 16 lines, about 70 per layer, which
+// is why the backgrounds still price themselves out below the water line.
+// Above the water line HPZ has no deformation at all (it never touches
+// DEFORM_FG / DEFORM_BG), so every layer goes hardware there.
+// First low-layer index rendered hardware this frame; tLayerMidPoint (or 4)
+// means "none". Software layers render into the framebuffer, which the PVR
+// shows at z=1 BEHIND all hardware quads — so software layers are only
+// correct as a BACK-most prefix of the low draw order. We walk the low
+// layers front-to-back and extend the hardware suffix while layers qualify;
+// the first deformed / non-HSCROLL layer ends it. A deformed back-most BG
+// (EHZ's water ripple) therefore stays software while every layer in front
+// of it still goes hardware.
+static int dcLowTileHWFrom = 4;
+
+// Below the water line the BACKGROUND ripple (DEFORM_BG_WATER) is a full sine
+// period every 16 lines — roughly 70 extra bands per layer, more quads than
+// the queue can hold alongside the foreground, so the backgrounds stay
+// software there. Set this to 1 to hold a BACKGROUND layer's deformation
+// constant across each band instead of varying it per line: the backgrounds
+// then cost no extra bands and go hardware too, at the price of quantising a
+// +-1..3px ripple on layers that sit behind everything. The FOREGROUND is
+// always exact regardless, so nothing the player collides with ever moves.
+// A .cpp-only change: flip it, plain `make`, no `make clean`.
+#define DC_BG_DEFORM_COARSE 0
+
+// True when any active layer is a 3D type (the special stage half-pipe).
+// The 3D renderers project into the FRAMEBUFFER and rely on classic
+// paint-over compositing: the flat tile layout is drawn first, then the
+// projected pipe is painted OVER it. Hardware tile quads float above the
+// framebuffer (z >= 2), which lifted the flat layout over the projected
+// pipe — the special stage showed flat rainbow diamonds instead of the
+// half-pipe. In 3D stages every tile pass (high included) stays software;
+// sprites remain hardware, which is above the pipe where they belong.
+static bool dc3DTileStage = false;
+
+static void DC_EvalLowTileHW()
+{
+    const int mid = tLayerMidPoint < 4 ? tLayerMidPoint : 4;
+    int from      = mid;
+
+    dc3DTileStage = false;
+    for (int i = 0; i < 4; ++i) {
+        const byte lid = activeTileLayers[i];
+        if (lid < LAYER_COUNT) {
+            const byte t = stageLayouts[lid].type;
+            if (t == LAYER_3DFLOOR || t == LAYER_3DSKY)
+                dc3DTileStage = true;
+        }
+    }
+    if (dc3DTileStage) {
+        dcLowTileHWFrom = mid;
+        static bool logged3D = false;
+        if (!logged3D) {
+            DC_LOG("[DC] 3D stage: tile passes software (pipe compositing)\n");
+            logged3D = true;
+        }
+        return;
+    }
+
+    int quadEstimate = 0;
+    for (int i = mid - 1; i >= 0; --i) {
+        const byte lid = activeTileLayers[i];
+        if (lid >= LAYER_COUNT) {
+            from = i; // empty slot: draws nothing, doesn't end the suffix
+            continue;
+        }
+        TileLayer *layer = &stageLayouts[lid];
+        if (!layer->xsize || !layer->ysize || layer->type == LAYER_NOSCROLL) {
+            from = i; // never drawn: neutral
+            continue;
+        }
+        if (layer->type != LAYER_HSCROLL)
+            break; // VSCROLL/3D: software-only, ends the hardware suffix
+
+        // Approximate the scroll state (scrollPos advances inside the draw
+        // call itself; one frame of drift can't change these coarse checks).
+        const int fullheight = layer->ysize << 7;
+        int yscroll;
+        if (lid)
+            yscroll = ((yScrollOffset * layer->parallaxFactor >> 8) + (layer->scrollPos >> 16)) % fullheight;
+        else
+            yscroll = yScrollOffset % fullheight;
+        if (yscroll < 0)
+            yscroll += fullheight;
+
+        // Deformation tables, indexed exactly as DrawHLineScrollLayer does:
+        // the (byte) masks the BASE only and the per-line advance runs past
+        // it into the duplicated tail SetLayerDeformation maintains
+        // (DEFORM_STORE=256 entries copied up, DEFORM_COUNT=576 total, so a
+        // base of <=255 plus 239 screen lines stays in bounds).
+        const int dfYS = lid ? yscroll : yScrollOffset; // matches the drawer
+        const int *dfAbove, *dfBelow;
+        if (lid) {
+            dfAbove = &bgDeformationData2[(byte)(dfYS + layer->deformationOffset)];
+            dfBelow = &bgDeformationData3[(byte)(dfYS + waterDrawPos + layer->deformationOffsetW)];
+        }
+        else {
+            dfAbove = &bgDeformationData0[(byte)(dfYS + layer->deformationOffset)];
+            dfBelow = &bgDeformationData1[(byte)(dfYS + waterDrawPos + layer->deformationOffsetW)];
+        }
+        const bool coarseDf = DC_BG_DEFORM_COARSE && lid != 0;
+
+        int bands  = 1;
+        byte prev  = layer->lineScroll[yscroll];
+        int prevDf = hParallax.deform[prev] ? (waterDrawPos > 0 ? dfAbove[0] : dfBelow[0]) : 0;
+        for (int line = 1; line < SCREEN_YSIZE; ++line) {
+            const int wy = (yscroll + line) % fullheight;
+            const byte s = layer->lineScroll[wy];
+            const int df = hParallax.deform[s] ? (line < waterDrawPos ? dfAbove[line] : dfBelow[line - waterDrawPos]) : 0;
+            if (s != prev || (wy & 0xF) == 0 || line == waterDrawPos || (!coarseDf && df != prevDf))
+                ++bands;
+            prev   = s;
+            prevDf = df;
+        }
+
+        // Queue-headroom bound (worst case, before blank-tile skipping).
+        quadEstimate += bands * ((SCREEN_XSIZE / TILE_SIZE) + 2);
+        if (quadEstimate > 2200)
+            break;
+
+        from = i;
+    }
+
+    dcLowTileHWFrom = from;
+
+    // One-shot log whenever the split changes (stage transitions, water on
+    // screen, ...): tells us from the serial log exactly which layers run
+    // hardware without per-frame spam.
+    static int lastFrom = -99;
+    if (from != lastFrom) {
+        DC_LOG("[DC] low tile passes: hardware from layer %d (mid=%d)\n", from, mid);
+        lastFrom = from;
+    }
+}
+
+static void DC_DrawHLineScrollLayerHW(int layerID, bool abovePass)
+{
+    TileLayer *layer = &stageLayouts[activeTileLayers[layerID]];
+
+    int layerwidth  = layer->xsize;
+    int layerheight = layer->ysize;
+    const byte plane = abovePass ? 1 : 0;
+
+    byte *lineScroll;
+    int yscrollOffset = 0;
+    if (activeTileLayers[layerID]) { // BG Layer
+        int yScroll    = yScrollOffset * layer->parallaxFactor >> 8;
+        int fullheight = layerheight << 7;
+        layer->scrollPos += layer->scrollSpeed;
+        if (layer->scrollPos > fullheight << 16)
+            layer->scrollPos -= fullheight << 16;
+        yscrollOffset = (yScroll + (layer->scrollPos >> 16)) % fullheight;
+        lineScroll    = layer->lineScroll;
+    }
+    else { // FG Layer
+        lastXSize     = layer->xsize;
+        yscrollOffset = yScrollOffset;
+        lineScroll    = layer->lineScroll;
+        for (int i = 0; i < PARALLAX_COUNT; ++i) hParallax.linePos[i] = xScrollOffset;
+    }
+
+    if (layer->type == LAYER_HSCROLL) {
+        if (lastXSize != layerwidth) {
+            int fullLayerwidth = layerwidth << 7;
+            for (int i = 0; i < hParallax.entryCount; ++i) {
+                hParallax.linePos[i] = xScrollOffset * hParallax.parallaxFactor[i] >> 8;
+                if (hParallax.scrollPos[i] > fullLayerwidth << 16)
+                    hParallax.scrollPos[i] -= fullLayerwidth << 16;
+                if (hParallax.scrollPos[i] < 0)
+                    hParallax.scrollPos[i] += fullLayerwidth << 16;
+                hParallax.linePos[i] += hParallax.scrollPos[i] >> 16;
+                hParallax.linePos[i] %= fullLayerwidth;
+            }
+        }
+        int w = -1;
+        if (activeTileLayers[layerID])
+            w = layerwidth;
+        lastXSize = w;
+    }
+
+    const int fullLayerwidth = layerwidth << 7;
+    const int fullheight     = layerheight << 7;
+
+    int tileYPos = yscrollOffset % fullheight;
+    if (tileYPos < 0)
+        tileYPos += fullheight;
+
+    // Per-line deformation, indexed exactly as the software path does it:
+    // above the water line from deformationOffset, below it from
+    // deformationOffsetW biased by waterDrawPos, and only applied when the
+    // line's own parallax entry carries the deform flag. The (byte) masks
+    // the BASE only; the per-line advance runs into the duplicated tail that
+    // SetLayerDeformation maintains.
+    const int *dfAbove, *dfBelow;
+    if (activeTileLayers[layerID]) {
+        dfAbove = &bgDeformationData2[(byte)(yscrollOffset + layer->deformationOffset)];
+        dfBelow = &bgDeformationData3[(byte)(yscrollOffset + waterDrawPos + layer->deformationOffsetW)];
+    }
+    else {
+        dfAbove = &bgDeformationData0[(byte)(yscrollOffset + layer->deformationOffset)];
+        dfBelow = &bgDeformationData1[(byte)(yscrollOffset + waterDrawPos + layer->deformationOffsetW)];
+    }
+    const bool coarseDf = DC_BG_DEFORM_COARSE && activeTileLayers[layerID] != 0;
+
+    // Deformation offset for screen line y. Identical arithmetic to
+    // DrawHLineScrollLayer's two-region walk, just addressed by line instead
+    // of by an advancing pointer.
+    auto deformAt = [&](int y) -> int {
+        const byte s = lineScroll[(tileYPos + y) % fullheight];
+        if (!hParallax.deform[s])
+            return 0;
+        return (y < waterDrawPos) ? dfAbove[y] : dfBelow[y - waterDrawPos];
+    };
+
+    // Walk the screen in horizontal bands: a band ends at a tile-row
+    // boundary, wherever the per-line scroll index changes, wherever the
+    // deformation offset changes, or at the water line — so parallax strips
+    // and the water ripple both keep their exact per-line positions.
+    int screenY = 0;
+    while (screenY < SCREEN_YSIZE) {
+        const int wy      = (tileYPos + screenY) % fullheight; // world line of this band
+        const int tileY16 = wy & 0xF;
+        int maxRows       = TILE_SIZE - tileY16; // lines to the next tile boundary
+        if (screenY + maxRows > SCREEN_YSIZE)
+            maxRows = SCREEN_YSIZE - screenY;
+        // Never straddle the water line: the two sides read different tables.
+        if (screenY < waterDrawPos && screenY + maxRows > waterDrawPos)
+            maxRows = waterDrawPos - screenY;
+
+        const byte scrollIdx = lineScroll[wy];
+        const int deform     = deformAt(screenY);
+        int rows             = 1;
+        while (rows < maxRows && lineScroll[(tileYPos + screenY + rows) % fullheight] == scrollIdx
+               && (coarseDf || deformAt(screenY + rows) == deform))
+            ++rows;
+
+        const int chunkY = wy >> 7;
+        const int tileY  = (wy & 0x7F) >> 4;
+
+        // X scroll for the band (constant across it by construction).
+        int chunkX = hParallax.linePos[scrollIdx] + deform;
+        chunkX %= fullLayerwidth;
+        if (chunkX < 0)
+            chunkX += fullLayerwidth;
+
+        int screenX = -(chunkX & 0xF);            // first tile may start mid-tile
+        int worldX  = chunkX - (chunkX & 0xF);    // tile-aligned world x
+        while (screenX < SCREEN_XSIZE) {
+            int wx = worldX % fullLayerwidth;
+            if (wx < 0)
+                wx += fullLayerwidth;
+            const int chunk = (layer->tiles[(wx >> 7) + (chunkY << 8)] << 6) + ((wx & 0x7F) >> 4) + 8 * tileY;
+            if (tiles128x128.visualPlane[chunk] == plane)
+                DC_QueueTileQuad(tiles128x128.tileIndex[chunk], tiles128x128.direction[chunk], screenX, screenY, tileY16, rows);
+            screenX += TILE_SIZE;
+            worldX += TILE_SIZE;
+        }
+        screenY += rows;
+    }
+}
+#endif
+
 void DrawHLineScrollLayer(int layerID)
 {
     TileLayer *layer = &stageLayouts[activeTileLayers[layerID]];
     if (!layer->xsize || !layer->ysize)
         return;
+
+#if RETRO_USING_KOS
+    // High pass: always hardware (a software high plane would render behind
+    // sprites). Low passes: hardware from dcLowTileHWFrom onward (see
+    // DC_EvalLowTileHW) — layers before that render software into the
+    // framebuffer, which correctly sits behind all hardware content.
+    // 3D stages (special stage): everything software — the projected pipe
+    // must paint OVER the flat layout in the framebuffer.
+    if (!dc3DTileStage) {
+        if (layerID >= tLayerMidPoint) {
+            DC_DrawHLineScrollLayerHW(layerID, true);
+            return;
+        }
+        if (layerID >= dcLowTileHWFrom) {
+            DC_DrawHLineScrollLayerHW(layerID, false);
+            return;
+        }
+    }
+#endif
 
 #if RETRO_SOFTWARE_RENDER
     int screenwidth16  = (GFX_LINESIZE >> 4) - 1;
@@ -2667,6 +3042,17 @@ void DrawRectangle(int XPos, int YPos, int width, int height, int R, int G, int 
 {
     if (A > 0xFF)
         A = 0xFF;
+#if RETRO_USING_KOS
+    // Dreamcast: the software path below blends into Engine.frameBuffer, which
+    // is only the background layer here — a rect meant to veil the hardware
+    // sprites (e.g. the title emblem's fade-in-from-black) would miss them.
+    // Queue a hardware colour quad at the current draw-order z instead so it
+    // layers correctly against the sprites drawn around it.
+    if (DC_UseHWSprites()) {
+        DC_QueueRect(XPos, YPos, width, height, R, G, B, A);
+        return;
+    }
+#endif
 #if RETRO_SOFTWARE_RENDER
     if (width + XPos > GFX_LINESIZE)
         width = GFX_LINESIZE - XPos;
@@ -2893,6 +3279,13 @@ void DrawScaledTintMask(int direction, int XPos, int YPos, int pivotX, int pivot
 
 void DrawSprite(int XPos, int YPos, int width, int height, int sprX, int sprY, int sheetID)
 {
+#if RETRO_USING_KOS
+    // Dreamcast: render as a PVR hardware quad instead of a software blit.
+    if (DC_UseHWSprites()) {
+        DC_QueueSprite(sheetID, XPos, YPos, width, height, sprX, sprY, FLIP_NONE);
+        return;
+    }
+#endif
 #if RETRO_SOFTWARE_RENDER
     if (width + XPos > GFX_LINESIZE)
         width = GFX_LINESIZE - XPos;
@@ -2979,6 +3372,13 @@ void DrawSpriteClipped(int XPos, int YPos, int width, int height, int sprX, int 
 
 void DrawSpriteFlipped(int XPos, int YPos, int width, int height, int sprX, int sprY, int direction, int sheetID)
 {
+#if RETRO_USING_KOS
+    // Dreamcast: render as a PVR hardware quad instead of a software blit.
+    if (DC_UseHWSprites()) {
+        DC_QueueSprite(sheetID, XPos, YPos, width, height, sprX, sprY, direction);
+        return;
+    }
+#endif
 #if RETRO_SOFTWARE_RENDER
     int widthFlip  = width;
     int heightFlip = height;
@@ -3100,9 +3500,71 @@ void DrawSpriteFlipped(int XPos, int YPos, int width, int height, int sprX, int 
     }
 #endif
 }
+#if RETRO_USING_KOS
+// Shared corner math for the rotated / rotozoomed hardware quads. Mirrors the
+// software rasterizer's transform exactly: 512-step angle tables sampled at
+// the INVERTED angle (0x200 - rotation), forward mapping
+//   screen = pos + (sin*ly + cos*lx, cos*ly - sin*lx) / 512
+// and FLIP_X mirroring in local space about the pivot BEFORE rotation (the
+// local x range flips sign; texel sprX stays on the +pivotX side).
+static void DC_QueueRotatedQuad(int direction, int XPos, int YPos, int pivotX, int pivotY, int sprX, int sprY, int width, int height, int rotation,
+                                float fscale, int sheetID)
+{
+    int angle = rotation & 0x1FF;
+    if (angle)
+        angle = 0x200 - angle;
+    const float s = fscale * (float)sin512LookupTable[angle] * (1.0f / 512.0f);
+    const float c = fscale * (float)cos512LookupTable[angle] * (1.0f / 512.0f);
+
+    // Local corner offsets, texture order TL,TR,BL,BR (lx0 = texture-left).
+    float lx0, lx1;
+    if (direction == FLIP_X) {
+        lx0 = (float)pivotX;
+        lx1 = (float)(pivotX - width);
+    }
+    else {
+        lx0 = (float)-pivotX;
+        lx1 = (float)(width - pivotX);
+    }
+    const float ly0 = (float)-pivotY;
+    const float ly1 = (float)(height - pivotY);
+
+    const float lxs[4] = { lx0, lx1, lx0, lx1 };
+    const float lys[4] = { ly0, ly0, ly1, ly1 };
+    float xs[4], ys[4];
+    for (int i = 0; i < 4; ++i) {
+        xs[i] = XPos + s * lys[i] + c * lxs[i];
+        ys[i] = YPos + c * lys[i] - s * lxs[i];
+    }
+    DC_QueueSpriteQuad(sheetID, xs, ys, sprX, sprY, width, height, DC_INK_OPAQUE, 0xFF);
+}
+#endif
+
 void DrawSpriteScaled(int direction, int XPos, int YPos, int pivotX, int pivotY, int scaleX, int scaleY, int width, int height, int sprX, int sprY,
                       int sheetID)
 {
+#if RETRO_USING_KOS
+    // Dreamcast: hardware quad. scale is 9-bit fixed point (512 = 1.0); the
+    // software rasterizer places the rect at pos - scale*pivot/512 and sizes
+    // it scale*dim/512. FLIP_X keeps the same rect and mirrors the sampling,
+    // so pass mirrored geometry (texture-left corner on the right).
+    if (DC_UseHWSprites()) {
+        const float sx = (float)scaleX * (1.0f / 512.0f);
+        const float sy = (float)scaleY * (1.0f / 512.0f);
+        const float x0 = XPos - sx * pivotX, x1 = x0 + sx * width;
+        const float y0 = YPos - sy * pivotY, y1 = y0 + sy * height;
+        float xs[4];
+        if (direction) {
+            xs[0] = x1; xs[1] = x0; xs[2] = x1; xs[3] = x0;
+        }
+        else {
+            xs[0] = x0; xs[1] = x1; xs[2] = x0; xs[3] = x1;
+        }
+        const float ys[4] = { y0, y0, y1, y1 };
+        DC_QueueSpriteQuad(sheetID, xs, ys, sprX, sprY, width, height, DC_INK_OPAQUE, 0xFF);
+        return;
+    }
+#endif
 #if RETRO_SOFTWARE_RENDER
     int roundedYPos = 0;
     int roundedXPos = 0;
@@ -3217,6 +3679,13 @@ void DrawScaledChar(int direction, int XPos, int YPos, int pivotX, int pivotY, i
 void DrawSpriteRotated(int direction, int XPos, int YPos, int pivotX, int pivotY, int sprX, int sprY, int width, int height, int rotation,
                        int sheetID)
 {
+#if RETRO_USING_KOS
+    // Dreamcast: hardware quad (rolling/tilted Sonic, etc).
+    if (DC_UseHWSprites()) {
+        DC_QueueRotatedQuad(direction, XPos, YPos, pivotX, pivotY, sprX, sprY, width, height, rotation, 1.0f, sheetID);
+        return;
+    }
+#endif
 #if RETRO_SOFTWARE_RENDER
     int sprXPos    = (pivotX + sprX) << 9;
     int sprYPos    = (pivotY + sprY) << 9;
@@ -3365,6 +3834,15 @@ void DrawSpriteRotated(int direction, int XPos, int YPos, int pivotX, int pivotY
 void DrawSpriteRotozoom(int direction, int XPos, int YPos, int pivotX, int pivotY, int sprX, int sprY, int width, int height, int rotation, int scale,
                         int sheetID)
 {
+#if RETRO_USING_KOS
+    // Dreamcast: hardware quad. scale is 9-bit fixed point (512 = 1.0).
+    if (DC_UseHWSprites()) {
+        if (scale == 0)
+            return;
+        DC_QueueRotatedQuad(direction, XPos, YPos, pivotX, pivotY, sprX, sprY, width, height, rotation, (float)scale * (1.0f / 512.0f), sheetID);
+        return;
+    }
+#endif
 #if RETRO_SOFTWARE_RENDER
     if (scale == 0)
         return;
@@ -3518,6 +3996,13 @@ void DrawSpriteRotozoom(int direction, int XPos, int YPos, int pivotX, int pivot
 
 void DrawBlendedSprite(int XPos, int YPos, int width, int height, int sprX, int sprY, int sheetID)
 {
+#if RETRO_USING_KOS
+    // 50% blend -> hardware alpha quad at half opacity.
+    if (DC_UseHWSprites()) {
+        DC_QueueSpriteInk(sheetID, XPos, YPos, width, height, sprX, sprY, FLIP_NONE, DC_INK_ALPHA, 0x80);
+        return;
+    }
+#endif
 #if RETRO_SOFTWARE_RENDER
     if (width + XPos > GFX_LINESIZE)
         width = GFX_LINESIZE - XPos;
@@ -3562,6 +4047,12 @@ void DrawAlphaBlendedSprite(int XPos, int YPos, int width, int height, int sprX,
 {
     if (alpha > 0xFF)
         alpha = 0xFF;
+#if RETRO_USING_KOS
+    if (DC_UseHWSprites()) {
+        DC_QueueSpriteInk(sheetID, XPos, YPos, width, height, sprX, sprY, FLIP_NONE, DC_INK_ALPHA, alpha);
+        return;
+    }
+#endif
 #if RETRO_SOFTWARE_RENDER
     if (width + XPos > GFX_LINESIZE)
         width = GFX_LINESIZE - XPos;
@@ -3634,6 +4125,12 @@ void DrawAdditiveBlendedSprite(int XPos, int YPos, int width, int height, int sp
 {
     if (alpha > 0xFF)
         alpha = 0xFF;
+#if RETRO_USING_KOS
+    if (DC_UseHWSprites()) {
+        DC_QueueSpriteInk(sheetID, XPos, YPos, width, height, sprX, sprY, FLIP_NONE, DC_INK_ADD, alpha);
+        return;
+    }
+#endif
 #if RETRO_SOFTWARE_RENDER
     if (width + XPos > GFX_LINESIZE)
         width = GFX_LINESIZE - XPos;
@@ -3687,6 +4184,14 @@ void DrawSubtractiveBlendedSprite(int XPos, int YPos, int width, int height, int
 {
     if (alpha > 0xFF)
         alpha = 0xFF;
+#if RETRO_USING_KOS
+    // No native PVR subtractive mode; approximate with alpha blend so it at
+    // least layers correctly on hardware (subtractive sprites are rare).
+    if (DC_UseHWSprites()) {
+        DC_QueueSpriteInk(sheetID, XPos, YPos, width, height, sprX, sprY, FLIP_NONE, DC_INK_ALPHA, alpha);
+        return;
+    }
+#endif
 
 #if RETRO_SOFTWARE_RENDER
     if (width + XPos > GFX_LINESIZE)
@@ -3869,6 +4374,19 @@ void DrawFace(void *v, uint color)
     if (alpha > 0xFF)
         alpha = 0xFF;
 
+#if RETRO_USING_KOS
+    // Dreamcast: scene3D colored face -> flat PVR quad (special stage pipe).
+    // verts are in face winding order a,b,c,d; the PVR triangle strip wants
+    // a,b,d,c. 7-bit face alpha -> 8-bit (near-opaque treated as fully opaque).
+    {
+        const float xs[4] = { (float)verts[0].x, (float)verts[1].x, (float)verts[3].x, (float)verts[2].x };
+        const float ys[4] = { (float)verts[0].y, (float)verts[1].y, (float)verts[3].y, (float)verts[2].y };
+        uint a = (alpha >= 0xF0) ? 0xFFu : (uint)alpha;
+        DC_Queue3DColorQuad(xs, ys, (a << 24) | (color & 0x00FFFFFFu));
+    }
+    return;
+#endif
+
     if (verts[0].x < 0 && verts[1].x < 0 && verts[2].x < 0 && verts[3].x < 0)
         return;
 
@@ -4007,6 +4525,22 @@ void DrawFadedFace(void *v, uint color, uint fogColor, int alpha)
     if (alpha < 1)
         return;
 
+#if RETRO_USING_KOS
+    // Dreamcast: scene3D faded face -> flat PVR quad with the fog blend baked
+    // in on the CPU (per-face, not per-pixel): result = lerp(fog, color, alpha),
+    // opaque. verts winding a,b,c,d -> PVR strip a,b,d,c.
+    {
+        const uint ia = (uint)(0xFF - alpha);
+        const uint fr = (((color >> 16) & 0xFF) * (uint)alpha + ((fogColor >> 16) & 0xFF) * ia) / 0xFF;
+        const uint fg = (((color >> 8) & 0xFF) * (uint)alpha + ((fogColor >> 8) & 0xFF) * ia) / 0xFF;
+        const uint fb = ((color & 0xFF) * (uint)alpha + (fogColor & 0xFF) * ia) / 0xFF;
+        const float xs[4] = { (float)verts[0].x, (float)verts[1].x, (float)verts[3].x, (float)verts[2].x };
+        const float ys[4] = { (float)verts[0].y, (float)verts[1].y, (float)verts[3].y, (float)verts[2].y };
+        DC_Queue3DColorQuad(xs, ys, 0xFF000000u | (fr << 16) | (fg << 8) | fb);
+    }
+    return;
+#endif
+
     if (verts[0].x < 0 && verts[1].x < 0 && verts[2].x < 0 && verts[3].x < 0)
         return;
 
@@ -4115,6 +4649,21 @@ void DrawFadedFace(void *v, uint color, uint fogColor, int alpha)
 void DrawTexturedFace(void *v, byte sheetID)
 {
     Vertex *verts = (Vertex *)v;
+
+#if RETRO_USING_KOS
+    // Dreamcast: scene3D textured face -> hardware textured quad. The special
+    // stage's textured faces (FACE_TEXTURED_C checkpoint bands) are billboards
+    // with rectangular UVs and corners already in TL,TR,BL,BR order — exactly
+    // what DC_QueueSpriteQuad expects. UVs are raw sheet texels.
+    {
+        const float xs[4] = { (float)verts[0].x, (float)verts[1].x, (float)verts[2].x, (float)verts[3].x };
+        const float ys[4] = { (float)verts[0].y, (float)verts[1].y, (float)verts[2].y, (float)verts[3].y };
+        const int sprX = verts[0].u, sprY = verts[0].v;
+        const int w = verts[1].u - verts[0].u, h = verts[2].v - verts[0].v;
+        DC_QueueSpriteQuad(sheetID, xs, ys, sprX, sprY, w, h, DC_INK_OPAQUE, 0xFF);
+    }
+    return;
+#endif
 
     if (verts[0].x < 0 && verts[1].x < 0 && verts[2].x < 0 && verts[3].x < 0)
         return;
@@ -4242,6 +4791,19 @@ void DrawTexturedFace(void *v, byte sheetID)
 void DrawTexturedFaceBlended(void *v, byte sheetID)
 {
     Vertex *verts = (Vertex *)v;
+
+#if RETRO_USING_KOS
+    // Dreamcast: same billboard mapping as DrawTexturedFace, alpha-blended.
+    {
+        const float xs[4] = { (float)verts[0].x, (float)verts[1].x, (float)verts[2].x, (float)verts[3].x };
+        const float ys[4] = { (float)verts[0].y, (float)verts[1].y, (float)verts[2].y, (float)verts[3].y };
+        const int sprX = verts[0].u, sprY = verts[0].v;
+        const int w = verts[1].u - verts[0].u, h = verts[2].v - verts[0].v;
+        DC_QueueSpriteQuad(sheetID, xs, ys, sprX, sprY, w, h, DC_INK_ALPHA, 0x80);
+    }
+    return;
+#endif
+
     if (verts[0].x < 0 && verts[1].x < 0 && verts[2].x < 0 && verts[3].x < 0)
         return;
 

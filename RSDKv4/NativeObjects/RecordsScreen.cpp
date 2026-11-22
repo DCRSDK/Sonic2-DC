@@ -1,4 +1,7 @@
 #include "RetroEngine.hpp"
+#if RETRO_USING_KOS
+#include "Dreamcast/DCSave.hpp"
+#endif
 
 float timeAttackU[] = { 1.0, 321.0, 641.0, 1.0, 321.0, 641.0, 641.0 };
 float timeAttackV[] = { 1.0, 1.0, 1.0, 241.0, 241.0, 241.0, 721.0 };
@@ -607,6 +610,9 @@ void RecordsScreen_Main(void *objPtr)
                     self->state = RECORDSSCREEN_STATE_EXITRESULTS;
                     PlaySfxByName("Event", false);
                     WriteSaveRAMData();
+#if RETRO_USING_KOS
+                    DC_FlushSaves(); // menu-side write - see SettingsScreen.cpp for why
+#endif
                 }
 
                 int pos = 0;

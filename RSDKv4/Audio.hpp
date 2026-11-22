@@ -16,11 +16,48 @@
 
 #define MIX_BUFFER_SAMPLES (256)
 
+#if RETRO_USING_KOS
+// Device output format for the Dreamcast backend (see Dreamcast/DCAudio.cpp)
+#define AUDIO_FREQUENCY (44100)
+#define AUDIO_CHANNELS  (2)
+// VRAM staging size per stream slot for OGG SFX decode. Music used to need
+// the full 2MB MUSBUFFER_SIZE here, but music now streams raw PCM from CD and
+// never touches this VRAM — only small OGG SFX briefly stage into it while
+// tremor decodes. A 512KB slot is far larger than any SFX .ogg, and shrinking
+// from 2MB frees ~3MB of VRAM for hardware-sprite textures.
+#define DC_SFX_STAGE_SIZE (0x80000) // 512 KB per slot
+// Raw-PCM music streaming hooks (implemented in Dreamcast/DCAudio.cpp).
+// Declared here so every TU that includes Audio.hpp (StopMusic/FreeMusInfo
+// are inline) can see them without pulling in DCCommon.hpp.
+//
+// loopPoint and startFrame are PCM *frame* indices in the ORIGINAL 44100 Hz
+// ogg the loop tables were authored against — the same units ov_pcm_seek takes
+// on desktop — not byte offsets into the raw 22050 Hz file. DC_MusicOpen does
+// the rescale. startFrame is 0 for a plain PlayMusic; SwapMusicTrack passes
+// the scaled position of the outgoing track so the incoming one resumes in
+// musical sync.
+//
+// Keep this signature byte-identical to the one in DCCommon.hpp. A stale copy
+// here does not error out — it just becomes a second overload that nothing
+// defines, so the mismatch only surfaces at link time or, worse, not at all.
+bool DC_MusicOpen(const char *path, bool loop, uint loopPoint, uint startFrame);
+// Position already heard, in original-ogg PCM frames (the DC ov_pcm_tell).
+uint DC_MusicTell();
+void DC_MusicClose();
+#endif
+
 #if RETRO_USING_SDL1 || RETRO_USING_SDL2
 
 #define LockAudioDevice()   SDL_LockAudio()
 #define UnlockAudioDevice() SDL_UnlockAudio()
 
+#elif RETRO_USING_KOS
+// Implemented in Dreamcast/DCAudio.cpp — a KOS mutex shared with the
+// snd_stream polling thread.
+void DC_LockAudio();
+void DC_UnlockAudio();
+#define LockAudioDevice()   DC_LockAudio()
+#define UnlockAudioDevice() DC_UnlockAudio()
 #else
 #define LockAudioDevice()   ;
 #define UnlockAudioDevice() ;
@@ -33,7 +70,12 @@ struct TrackInfo {
 };
 
 struct StreamInfo {
+#if !RETRO_USING_KOS
+    // Dreamcast decodes no Vorbis (see the note in RetroEngine.hpp): this
+    // member is the reason the type had to be complete, and therefore the
+    // reason libtremor was still linked long after nothing called it.
     OggVorbis_File vorbisFile;
+#endif
     int vorbBitstream;
 #if RETRO_USING_SDL1
     SDL_AudioSpec spec;
@@ -52,6 +94,13 @@ struct SFXInfo {
     Sint16 *buffer;
     size_t length;
     bool loaded;
+#if RETRO_USING_KOS
+    // Dreamcast: samples are stored in their native format (no upconversion
+    // to device format — that would 4x the memory cost); the mixer converts
+    // rate/channels on the fly.
+    int rate;
+    byte channels;
+#endif
 };
 
 struct ChannelInfo {
@@ -60,10 +109,20 @@ struct ChannelInfo {
     int sfxID;
     byte loopSFX;
     sbyte pan;
+#if RETRO_USING_KOS
+    uint stepPos; // 16.16 fixed-point resample accumulator
+#endif
 };
 
 struct StreamFile {
+#if RETRO_USING_KOS
+    // Dreamcast: the music file buffer lives in PVR VRAM (8MB, of which the
+    // 320x240 framebuffer uses only ~150KB) instead of main RAM. Accessed
+    // through DC_VramRead/DC_VramWrite (32-bit safe accesses only).
+    uint vramBase; // byte offset into VRAM
+#else
     byte buffer[MUSBUFFER_SIZE];
+#endif
     int fileSize;
     int filePos;
 };
@@ -110,7 +169,7 @@ extern SDL_AudioSpec audioDeviceFormat;
 int InitAudioPlayback();
 void LoadGlobalSfx();
 
-#if RETRO_USING_SDL1 || RETRO_USING_SDL2
+#if RETRO_USING_SDL1 || RETRO_USING_SDL2 || RETRO_USING_KOS
 #if !RETRO_USE_ORIGINAL_CODE
 // These functions did exist, but with different signatures
 void ProcessMusicStream(Sint32 *stream, size_t bytes_wanted);
@@ -123,6 +182,9 @@ inline void FreeMusInfo()
 {
     LockAudioDevice();
 
+#if RETRO_USING_KOS
+    DC_MusicClose();
+#else
 #if RETRO_USING_SDL2
     if (streamInfo[currentStreamIndex].stream)
         SDL_FreeAudioStream(streamInfo[currentStreamIndex].stream);
@@ -134,6 +196,7 @@ inline void FreeMusInfo()
 #if RETRO_USING_SDL2
     streamInfo[currentStreamIndex].stream = nullptr;
 #endif
+#endif // RETRO_USING_KOS
 
     UnlockAudioDevice();
 }
@@ -165,10 +228,29 @@ inline void StopMusic(bool setStatus)
 #endif
 }
 
+#if RETRO_USING_KOS
+// Dreamcast: a stage sfx may live in the AICA's own 2MB of sound RAM rather
+// than on the main heap, playing on a hardware channel instead of through the
+// software mixer (see the AICA block at the bottom of DCAudio.cpp). Those have
+// no sfxChannels[] entry at all, so every stop/attribute path has to hand off
+// here first. Declared in DCCommon.hpp too, but repeated because the inline
+// functions just below are compiled before that header is reachable.
+bool DC_AicaSfxHas(int sfxID);
+bool DC_AicaSfxPlay(int sfxID, bool loop);
+bool DC_AicaSfxSetAttr(int sfxID, int loopCount, sbyte pan);
+void DC_AicaSfxStop(int sfxID);
+void DC_AicaSfxStopAll();
+void DC_AicaSfxUnloadStage();
+#endif
+
 void LoadSfx(char *filePath, byte sfxID);
 void PlaySfx(int sfx, bool loop);
 inline void StopSfx(int sfx)
 {
+#if RETRO_USING_KOS
+    DC_AicaSfxStop(sfx);
+#endif
+
     for (int i = 0; i < CHANNEL_COUNT; ++i) {
         if (sfxChannels[i].sfxID == sfx) {
             MEM_ZERO(sfxChannels[i]);
@@ -271,10 +353,32 @@ inline void StopAllSfx()
 
     for (int i = 0; i < CHANNEL_COUNT; ++i) sfxChannels[i].sfxID = -1;
 
+#if RETRO_USING_KOS
+    // The hardware channels aren't in sfxChannels[], so clearing that array
+    // leaves them running. Silence them here too.
+    DC_AicaSfxStopAll();
+#endif
+
 #if !RETRO_USE_ORIGINAL_CODE
     UnlockAudioDevice();
 #endif
 }
+#if RETRO_USING_KOS
+// Dreamcast: a stage sfx buffer may live in the bump arena rather than on the
+// heap (see the arena block in DCAudio.cpp), and an arena pointer must never
+// reach free(). DC_SfxFree checks which it is, so it is correct for every sfx
+// buffer regardless of where that one came from. DC_SfxArenaReset then reclaims
+// the whole arena in one go, once the individual buffers have been let go.
+void DC_SfxFree(void *ptr);
+void DC_SfxArenaReset();
+// Claims the arena block. Deliberately NOT called at audio init — see the arena
+// block in DCAudio.cpp; Scene.cpp calls it at the top of each stage load.
+void DC_SfxArenaAcquire();
+#define RETRO_SFX_FREE(ptr) DC_SfxFree(ptr)
+#else
+#define RETRO_SFX_FREE(ptr) free(ptr)
+#endif
+
 inline void ReleaseGlobalSfx()
 {
     for (int i = globalSFXCount - 1; i >= 0; --i) {
@@ -282,7 +386,7 @@ inline void ReleaseGlobalSfx()
             StrCopy(sfxList[i].name, "");
             StrCopy(sfxNames[i], "");
             if (sfxList[i].buffer)
-                free(sfxList[i].buffer);
+                RETRO_SFX_FREE(sfxList[i].buffer);
 
             sfxList[i].buffer = NULL;
             sfxList[i].length = 0;
@@ -294,12 +398,20 @@ inline void ReleaseGlobalSfx()
 }
 inline void ReleaseStageSfx()
 {
+#if RETRO_USING_KOS
+    // Stage sfx that were uploaded to the AICA have no buffer to free, so the
+    // loop below skips straight past them — the sound RAM they hold has to be
+    // handed back explicitly. Stops them first, so nothing is still reading a
+    // buffer that is about to be handed out again.
+    DC_AicaSfxUnloadStage();
+#endif
+
     for (int i = (stageSFXCount + globalSFXCount) - 1; i >= globalSFXCount; --i) {
         if (sfxList[i].loaded) {
             StrCopy(sfxList[i].name, "");
             StrCopy(sfxNames[i], "");
             if (sfxList[i].buffer)
-                free(sfxList[i].buffer);
+                RETRO_SFX_FREE(sfxList[i].buffer);
 
             sfxList[i].buffer = NULL;
             sfxList[i].length = 0;
@@ -308,6 +420,13 @@ inline void ReleaseStageSfx()
     }
 
     stageSFXCount = 0;
+
+#if RETRO_USING_KOS
+    // Every stage sfx has now been released, so the arena is empty by
+    // definition — rewind it. This is what makes the next stage's layout
+    // identical to this one's instead of being whatever the heap left behind.
+    DC_SfxArenaReset();
+#endif
 }
 
 inline void ReleaseAudioDevice()

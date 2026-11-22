@@ -1,7 +1,13 @@
 #ifndef STRING_H
 #define STRING_H
 
+#if RETRO_USING_KOS
+// Dreamcast: 2MB of script-string storage doesn't fit in 16MB RAM;
+// Sonic 1/2 use a fraction of this pool.
+#define STRSTORAGE_SIZE (250)
+#else
 #define STRSTORAGE_SIZE (1000)
+#endif
 #define STRING_SIZE     (0x400)
 
 #define CREDITS_LIST_COUNT (0x200)

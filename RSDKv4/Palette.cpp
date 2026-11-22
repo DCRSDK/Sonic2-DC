@@ -15,7 +15,9 @@ int GFX_LINESIZE_DOUBLE;
 int GFX_FRAMEBUFFERSIZE;
 int GFX_FBUFFERMINUSONE;
 
+#if RETRO_USING_OPENGL
 uint gfxPalette16to32[0x10000];
+#endif
 
 int fadeMode = 0;
 byte fadeA   = 0;

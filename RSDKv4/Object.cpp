@@ -364,6 +364,26 @@ void ProcessObjectControl(Entity *entity)
         entity->jumpHold  = keyDown.C || keyDown.B || keyDown.A;
         entity->jumpPress = keyPress.C || keyPress.B || keyPress.A;
     }
+#if !RETRO_USE_ORIGINAL_CODE
+    else if (entity->controlMode == 1 && inputP2Connected) {
+        // CONTROLMODE_P2 - the second local controller. Sonic 2's Player2Object
+        // puts the Tails sidekick in this mode and calls ProcessObjectControl()
+        // from Player2_Input_GamepadAssist once a human has taken him over.
+        // Same shape as player 1 above, including the left+right cancel.
+        entity->up   = keyDownP2.up;
+        entity->down = keyDownP2.down;
+        if (!keyDownP2.left || !keyDownP2.right) {
+            entity->left  = keyDownP2.left;
+            entity->right = keyDownP2.right;
+        }
+        else {
+            entity->left  = false;
+            entity->right = false;
+        }
+        entity->jumpHold  = keyDownP2.C || keyDownP2.B || keyDownP2.A;
+        entity->jumpPress = keyPressP2.C || keyPressP2.B || keyPressP2.A;
+    }
+#endif
 }
 
 void InitNativeObjectSystem()

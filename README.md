@@ -1,135 +1,78 @@
-![](header.png?raw=true)
+# **Sonic the Hedgehog 2 (2013) for SEGA Dreamcast**
+A Sonic 2/RSDKv4 port for SEGA Dreamcast based on the RSDKv4 Decompilation, using the mobile version as base.
 
-A complete decompilation of Retro Engine v4 and the menus from Sonic 1 and 2 (2013).
+<!-- Placeholder: replace this URL with the Sonic 2 header image. -->
+![Sonic 2 header](https://example.com/sonic2-header.png)
 
-# **SUPPORT THE OFFICIAL RELEASE OF SONIC 1 & 2**
-+ Without assets from the official releases, this decompilation will not run.
++ Requires ffmpeg and Python 3 (with Pillow and NumPy) for asset generation, as well as an existing KallistiOS and mkdcdisc install for compiling the .elf and building the CDI.
++ Compatible with GCC 14.4.1 / KOS 2.3.0, or GCC 14.3.0 / KOS 2.2.2. Build with anything else at your own risk.
++ Build in Linux or MacOS environments, or Windows via DreamSDK or WSL (Debian or Ubuntu based preferably)
++ Build from your own KallistiOS setup by cloning this git and following the instructions in BUILD_DREAMCAST.md or use the autobuilder [HERE](dreamcast/Sonic2_Dreamcast_Autobuilder.ipynb)
++ Bring your own Sonic 2 Data.rsdk (MUST be the 2013 mobile remaster; Origins is untested and presumed unsupported).
 
-+ You can get official releases of Sonic 1 & Sonic 2 from:
-  * Windows
-    * Via Steam, from [Sonic Origins](https://store.steampowered.com/app/1794960)
-    * Via the Epic Games Store, from [Sonic Origins](https://store.epicgames.com/en-US/p/sonic-origins)
-  * Nintendo Switch, from [Sonic Origins on the eShop](https://www.nintendo.com/games/detail/sonic-origins-switch/)
-  * iOS, Via the App Store
-  * Android, Via Google Play or Amazon
-    * Note that the mobile releases have been delisted. However, if you have downloaded one of these releases in the past, you can redownload it at any time in your device or store account's purchase history.
+NO ASSETS ARE PROVIDED IN THIS RELEASE.
 
-Even if your platform isn't supported by the official releases, you **must** buy or officially download it for the assets (you don't need to run the official release, you just need the game assets). See [here](https://rsdkmodding.com/Guides/Games/Sonic1-2/Datapack/) for a guide on how to find the required assets from your legally obtained copy/copies of the game(s).
+## Asset generation
 
-If you want to transfer your save(s) from the official mobile version(s), the **Android pre-forever** file path is `Android/data/com.sega.sonic1 or 2/SGame.bin` (other versions may have different file paths). Copy that file into the decompilation's folder with the name `SData.bin`.
+Music, global sound effects and the 2013 menu textures have to be converted
+before the Dreamcast can use them. Music and global sound effects play as raw
+PCM rather than being decoded from Vorbis on the SH4, and the menu art becomes
+VQ-compressed `.dtex` textures that stream straight into VRAM, since most of it
+is too large for the console to decode as PNG. Everything else, stage sound
+effects included, streams out of Data.rsdk untouched.
 
-# Additional Tweaks
-* Added the built in script compiler from RSDKv5U.
-* Added a built in mod loader and API, allowing to easily create and play mods with features such as save file redirection, custom achievements and XML GameConfig data.
-* [Custom menu and networking system for Sonic 2 multiplayer, allowing anyone to host and join servers and play 2P VS.](#server)
-* Egg Gauntlet Zone is playable in the Time Attack menu in Sonic 2, if you're using a version of the game that includes it.
-* There is now a `settings.ini` file that the game uses to load all settings, similar to Sonic Mania.
-* The dev menu can now be accessed from anywhere by pressing the `ESC` key if enabled in the config.
-* The `F12` pause, `F11` step over & fast forward debug features from Sonic Mania have all been ported and are enabled if `devMenu` is enabled in the config.
-* A number of additional dev menu debug features have been added:
-  * `F1` will load the first scene in the Presentation stage list (usually the title screen).
-  * `F2` and `F3` will load the previous and next scene in the current stage list.
-  * `F5` will reload the current scene, as well as all assets and scripts.
-  * `F8` and `F9` will visualize touch screen and object hitboxes.
-  * `F10` will activate a palette overlay that shows the game's 8 internal palettes in real time.
-* Added the idle screen dimming feature from Sonic Mania Plus, as well as allowing the user to disable it or set how long it takes for the screen to dim.
-
-# How to Build
-
-This project uses [CMake](https://cmake.org/), a versatile building system that supports many different compilers and platforms. You can download CMake [here](https://cmake.org/download/). **(Make sure to enable the feature to add CMake to the system PATH during the installation!)**
-
-## Get the source code
-
-**DO NOT** download the source code ZIP archive from GitHub, as they do not include the submodules required to build the decompilation.
-
-Instead, you will need to clone the repository using Git, which you can get [here](https://git-scm.com/downloads).
-
-Clone the repo **recursively**, using:
-`git clone --recursive https://github.com/RSDKModding/RSDKv4-Decompilation`
-
-If you've already cloned the repo, run this command inside of the repository:
-```git submodule update --init --recursive```
-
-## Getting dependencies
-
-### Windows
-To handle dependencies, you'll need to install [Visual Studio Community](https://visualstudio.microsoft.com/downloads/) (make sure to install the `Desktop development with C++` package during the installation) and [vcpkg](https://learn.microsoft.com/en-us/vcpkg/get_started/get-started?pivots=shell-cmd#1---set-up-vcpkg) (You only need to follow `1 - Set up vcpkg`).
-
-After installing those, run the following in Command Prompt (make sure to replace `[vcpkg root]` with the path to the vcpkg installation!):
-- `[vcpkg root]\vcpkg.exe install glew sdl2 libogg libvorbis --triplet=x64-windows-static` (If you're compiling a 32-bit build, replace `x64-windows-static` with `x86-windows-static`.)
-
-Finally, follow the [compilation steps below](#compiling) using `-DCMAKE_TOOLCHAIN_FILE=[vcpkg root]/scripts/buildsystems/vcpkg.cmake -DVCPKG_TARGET_TRIPLET=x64-windows-static -DCMAKE_PREFIX_PATH=[vcpkg root]/installed/x64-windows-static/` as arguments for `cmake -B build`.
-  - Make sure to replace each instance of `[vcpkg root]` with the path to the vcpkg installation!
-  - If you're compiling a 32-bit build, replace each instance of `x64-windows-static` with `x86-windows-static`.
-
-### Linux
-Install the following dependencies: then follow the [compilation steps below](#compiling):
-- **pacman (Arch):** `sudo pacman -S base-devel cmake glew sdl2 libogg libvorbis`
-- **apt (Debian/Ubuntu):** `sudo apt install build-essential cmake libglew-dev libglfw3-dev libsdl2-dev libogg-dev libvorbis-dev`
-- **rpm (Fedora):** `sudo dnf install make gcc cmake glew-devel glfw-devel SDL2-devel libogg-devel libvorbis-devel zlib-devel`
-- **apk (Alpine/PostmarketOS)** `sudo apk add build-base cmake glew-dev glfw-dev sdl2-dev libogg-dev libvorbis-dev`
-- Your favorite package manager here, [make a pull request](https://github.com/RSDKModding/RSDKv4-Decompilation/fork)
-
-### Android
-Follow the android build instructions [here.](./dependencies/android/README.md)
-
-## Compiling
-
-Compiling is as simple as typing the following in the root repository directory:
-```
-cmake -B build
-cmake --build build --config release
+```sh
+cd dreamcast
+./generate_assets.sh /path/to/Data.rsdk [stage_dir]
 ```
 
-The resulting build will be located somewhere in `build/` depending on your system.
+`stage_dir` defaults to `../build-dc`. Any `tools/<Name>.dtex` is copied over
+the converted `<Name>.png`, which is how this port's custom menu art reaches the
+disc. See `dreamcast/README.md` for the format contract and the verifier — a
+headerless file carries no sample rate, so a wrong conversion is a silent pitch
+shift rather than an error.
 
-The following cmake arguments are available when compiling:
-- Use these by adding `-D[flag-name]=[value]` to the end of the `cmake -B build` command. For example, to build with `RETRO_DISABLE_PLUS` set to on, add `-DRETRO_DISABLE_PLUS=on` to the command.
+## Running it
 
-### RSDKv4 flags
-- `RETRO_REVISION`: What revision to compile for. Takes an integer, defaults to `3` (Origins).
-- `RETRO_DISABLE_PLUS`: Whether or not to disable the Plus DLC. Takes a boolean (on/off): build with `on` when compiling for distribution. Defaults to `off`.
-- `RETRO_FORCE_CASE_INSENSITIVE`: Forces case insensivity when loading files. Takes a boolean, defaults to `off`.
-- `RETRO_MOD_LOADER`: Enables or disables the mod loader. Takes a boolean, defaults to `on`.
-- `RETRO_NETWORKING`: Enables or disables networking features used for Sonic 2's 2P VS mode. Takes a boolean, defaults to `on`.
-- `RETRO_USE_HW_RENDER`: Enables the Hardware Renderer used by the main menu and touch controls UI. Takes a boolean, defaults to `on`.
-- `RETRO_ORIGINAL_CODE`: Removes any custom code. *A playable game will not be built with this enabled.* Takes a boolean, defaults to `off`.
-- `RETRO_SDL_VERSION`: *Only change this if you know what you're doing.* Switches between using SDL1 or SDL2. Takes an integer of either `1` or `2`, defaults to `2`.
+**From a disc or GDEMU** — the default build. Package with mkdcdisc as
+described in BUILD_DREAMCAST.md, or let the autobuilder do it.
 
-## Unofficial Branches
-Follow the installation instructions in the readme of each branch.
-* For the **PlayStation Vita**, go to [Xeeynamo's fork](https://github.com/xeeynamo/Sonic-1-2-2013-Decompilation).
-* For the **Nintendo Switch**, go to [heyjoeway's fork](https://github.com/heyjoeway/Sonic-1-2-2013-Decompilation).
-* For the **Nintendo 3DS**, go to [JeffRuLz's fork](https://github.com/JeffRuLz/Sonic-1-2-2013-Decompilation).
-  * A New Nintendo 3DS is required for the games to run smoothly.
-* To play it on the web using **Wasm**, go to [mattConn's fork](https://github.com/mattConn/Sonic-Decompilation-WASM).
+**Over dcload-ip** — configure with `-DDC_DATA_ROOT=/pc/` in its own build
+directory (`build-pc`) and serve its contents as `/pc/`, which is dc-tool's
+working directory, so the loose `Data/` tree has to sit beside `Data.rsdk`
+there. Use a broadband adapter: dcload-serial cannot keep up with the music
+stream. You can also boot over dcload while reading `/cd/` from a disc in the
+drive, which keeps the console output without putting game data on the link.
 
-Because these branches are unofficial, we can't provide support for them and they may not be up-to-date.
+**What Works:**
++ Sonic 2 full game, every zone including Hidden Palace, plus the Special Stages — locked 60fps on real hardware
++ Sonic, Tails and Knuckles
++ The 2013 remaster menus, Time Attack and the ending sequence
++ Saves, achievements and Time Attack records on VMU, including a custom icon in the Dreamcast BIOS save menu and a winged "2" on the VMU's screen
++ Music and global sound effects streamed as raw PCM (no Vorbis decoding on-console), with stage sound effects held in the AICA's own sound RAM
 
-## Other Platforms
-Currently the only supported platforms are the ones listed above, however the backend uses libogg, libvorbis & SDL2 to power it (as well as tinyxml2 for the mod API and asio for networking), so the codebase is very multiplatform.
-If you're able to, you can clone this repo and port it to a platform not on the list.
+**What doesn't work:**
++ 2P VS — the menu entries are there but do nothing. It needs networking, and RSDKv4 has no split screen
++ Anything else needing networking — disabled
++ Mod loader — disabled
++ Leaderboard uploads (local scores are kept, there is nowhere to send them)
++ Anything else I may have missed or overlooked in testing (you tell me)
 
-# Server
-The multiplayer server requires Python 3.8 or later. You can download Python [here](https://www.python.org/downloads/).
+Dev menu is NOT enabled by default. You can access the Dev menu by placing a settings.ini with it toggled to ON from the PC decompilation (delete all sections other than the topmost with the Dev menu flag) at the root of the disc when you go to build your CDI — the autobuilder takes one as an optional upload alongside your Data.rsdk. It is accessed by pressing the Y button. When selecting stages in the Dev menu press Start button for regular play, or the A button for debug mode
 
-Before opening the server, all players need to edit the decompilation's `settings.ini` file to set `Host` and `Port` in the `Network` category to your local IPv4 address and the target port number, respectively. If you don't know what your local IPv4 address is, look up how to find it online. If you don't know what port number to use, use `8000`.
+**Special Thanks**
++ Rubberduckycooly & everyone involved with the RSDKv4 decompilation - without that none of this would have been possible
++ SF94 & everyone involved with the Sonic Mania Dreamcast port - this port was largely inspired by it, you guys rock!
++ Everyone who helped me behind the scenes - you're all the best!
 
-To use the server, open your console/shell in the folder [Server.py](./Server/Server.py) is located in, then run the command `py -3 Server.py [host ip] [port] debug`. You should see a "starting" line in the console if the server starts. To get a room code, open the Multiplayer menu (in Sonic 2, this is done after selecting a character in the 2P VS menu), then choose Host. To close the server, press CTRL+C in the console window.
+**Notice regarding AI use:**
 
-> [!WARNING]
-> The server is more-so a proof-of-concept and is known to be very unstable. Don't expect reliable connects to opponents.
+This was almost entirely created using Claude AI. I do not consider myself a coder, more a project director. If you have any views regarding AI use that would otherwise prevent you from trying this port out, that's entirely understandable, enjoy your life as you see fit.
 
-> [!NOTE]
-> The C++ server found in the `Server` folder has been deprecated and no longer works. It has been kept in the repo for reference purposes.
+Sonic the Hedgehog 2 (C) SEGA
 
-# FAQ
-You can find the FAQ [here](./FAQ.md).
+Original RSDK author: Christian "Taxman" Whitehead
 
-# Special Thanks
-* [st×tic](https://github.com/stxticOVFL) for helping me fix bugs, tweaking up my sometimes sloppy code and generally being really helpful and fun to work with on this project.
-* [biscuitball425](https://github.com/biscuitball425): for creating the header logo along with similar assets.
-* Everyone in the [Retro Engine Modding Server](https://dc.railgun.works/retroengine) for being supportive of me and for giving me a place to show off these things that I've found.
+Decompilation authors: Rubberduckycooly and st×tic
 
-# Contact:
-Join the [Retro Engine Modding Discord Server](https://dc.railgun.works/retroengine) for any extra questions you may need to know about the decompilation or modding it.
+# **SUPPORT THE OFFICIAL RELEASE**

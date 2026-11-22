@@ -1,6 +1,10 @@
 #include "RetroEngine.hpp"
 #include <cmath>
 
+#if RETRO_USING_KOS
+#include "Dreamcast/DCCommon.hpp"
+#endif
+
 int globalSFXCount = 0;
 int stageSFXCount  = 0;
 
@@ -44,6 +48,11 @@ SDL_AudioSpec audioDeviceFormat;
 #define ADJUST_VOLUME(s, v) (s = (s * v) / MAX_VOLUME)
 #endif
 
+#if RETRO_USING_KOS
+// AUDIO_FREQUENCY / AUDIO_CHANNELS come from Audio.hpp
+#define ADJUST_VOLUME(s, v) (s = (s * v) / MAX_VOLUME)
+#endif
+
 int InitAudioPlayback()
 {
     StopAllSfx(); //"init"
@@ -78,6 +87,15 @@ int InitAudioPlayback()
         return true; // no audio but game wont crash now
     }
 #endif // !RETRO_USING_SDL1
+#elif RETRO_USING_KOS
+    if (DC_InitAudioDevice()) {
+        audioEnabled = true;
+    }
+    else {
+        PrintLog("Unable to init KOS audio");
+        audioEnabled = false;
+        return true; // no audio but game wont crash now
+    }
 #endif
 #endif
 
@@ -164,6 +182,10 @@ void LoadGlobalSfx()
     for (int i = 0; i < CHANNEL_COUNT; ++i) sfxChannels[i].sfxID = -1;
 }
 
+#if !RETRO_USING_KOS
+// Vorbis stream callbacks. Compiled out on Dreamcast: nothing there decodes
+// Vorbis any more, and seekVorbis' ogg_int64_t parameter would drag the ogg
+// headers back in on its own even though no caller remains.
 size_t readVorbis(void *mem, size_t size, size_t nmemb, void *ptr)
 {
     StreamFile *file = (StreamFile *)ptr;
@@ -173,7 +195,11 @@ size_t readVorbis(void *mem, size_t size, size_t nmemb, void *ptr)
         n = file->fileSize - file->filePos;
 
     if (n) {
+#if RETRO_USING_KOS
+        DC_VramRead(mem, file->vramBase + file->filePos, n);
+#else
         memcpy(mem, &file->buffer[file->filePos], n);
+#endif
         file->filePos += n;
     }
     return n;
@@ -197,17 +223,31 @@ long tellVorbis(void *ptr)
     return file->filePos;
 }
 int closeVorbis(void *ptr) { return 1; }
+#endif // !RETRO_USING_KOS
 
 #if !RETRO_USE_ORIGINAL_CODE
 void ProcessMusicStream(Sint32 *stream, size_t bytes_wanted)
 {
+#if !RETRO_USING_KOS
     if (!streamFilePtr || !streamInfoPtr)
         return;
     if (!streamFilePtr->fileSize)
         return;
+#endif
     switch (musicStatus) {
         case MUSIC_READY:
         case MUSIC_PLAYING: {
+#if RETRO_USING_KOS
+            // Stream raw PCM from CD + upsample straight into the mix buffer
+            static Sint16 dcMusicBuf[MIX_BUFFER_SAMPLES];
+            size_t samplesWanted = bytes_wanted / sizeof(Sint16);
+            if (samplesWanted > MIX_BUFFER_SAMPLES)
+                samplesWanted = MIX_BUFFER_SAMPLES;
+
+            int samplesDone = DC_MusicReadSamples(dcMusicBuf, samplesWanted);
+            if (samplesDone > 0)
+                ProcessAudioMixing(stream, dcMusicBuf, samplesDone, (bgmVolume * masterVolume) / MAX_VOLUME, 0);
+#endif
 #if RETRO_USING_SDL2
             while (musicStatus == MUSIC_PLAYING && streamInfoPtr->stream && SDL_AudioStreamAvailable(streamInfoPtr->stream) < bytes_wanted) {
                 // We need more samples: get some
@@ -303,7 +343,14 @@ void ProcessMusicStream(Sint32 *stream, size_t bytes_wanted)
                 free(buffer);
 #endif
 
+#if !RETRO_USING_KOS
+            // KOS streams raw PCM with no OggVorbis_File / streamInfoPtr —
+            // this line dereferences a NULL streamInfoPtr on Dreamcast and
+            // faults the audio thread the instant music starts. (This was
+            // the real title-screen crash.) musicPosition is only used by
+            // the music-swap ratio feature, which the raw-PCM path skips.
             musicPosition = ov_pcm_tell(&streamInfoPtr->vorbisFile);
+#endif
             break;
         }
         case MUSIC_STOPPED:
@@ -342,6 +389,50 @@ void ProcessAudioPlayback(void *userdata, Uint8 *stream, int len)
             if (sfx->sfxID < 0)
                 continue;
 
+#if RETRO_USING_KOS
+            if (sfx->samplePtr) {
+                // samples are in native rate/channels; convert while mixing
+                Sint16 buffer[MIX_BUFFER_SAMPLES];
+                SFXInfo *sfxData = &sfxList[sfx->sfxID];
+                const int schan  = sfxData->channels >= 2 ? 2 : 1;
+                const uint step  = (uint)(((Uint64)sfxData->rate << 16) / AUDIO_FREQUENCY);
+
+                size_t frames_done        = 0;
+                const size_t frames_to_do = samples_to_do / 2;
+                while (frames_done < frames_to_do && sfx->samplePtr) {
+                    Sint16 l = sfx->samplePtr[0];
+                    Sint16 r = (schan == 2 && sfx->sampleLength > 1) ? sfx->samplePtr[1] : l;
+
+                    buffer[frames_done * 2]     = l;
+                    buffer[frames_done * 2 + 1] = r;
+                    ++frames_done;
+
+                    sfx->stepPos += step;
+                    size_t adv = (size_t)(sfx->stepPos >> 16) * schan;
+                    sfx->stepPos &= 0xFFFF;
+
+                    if (adv >= sfx->sampleLength) {
+                        if (sfx->loopSFX) {
+                            sfx->samplePtr    = sfxData->buffer;
+                            sfx->sampleLength = sfxData->length;
+                            sfx->stepPos      = 0;
+                        }
+                        else {
+                            MEM_ZEROP(sfx);
+                            sfx->sfxID = -1;
+                            break;
+                        }
+                    }
+                    else {
+                        sfx->samplePtr += adv;
+                        sfx->sampleLength -= adv;
+                    }
+                }
+
+                if (frames_done > 0)
+                    ProcessAudioMixing(mix_buffer, buffer, (int)(frames_done * 2), sfxVolume, sfx->pan);
+            }
+#else
             if (sfx->samplePtr) {
                 Sint16 buffer[MIX_BUFFER_SAMPLES];
 
@@ -371,10 +462,18 @@ void ProcessAudioPlayback(void *userdata, Uint8 *stream, int len)
                 ProcessAudioMixing(mix_buffer, buffer, (int)samples_done, sfxVolume, sfx->pan);
 #endif
             }
+#endif // RETRO_USING_KOS
         }
 
         // Clamp mixed samples back to 16-bit and write them to the output buffer
+#if RETRO_USING_KOS
+        // only write what was actually requested — writing the full chunk
+        // regardless (as below) overruns the output buffer when the request
+        // isn't a chunk multiple
+        for (size_t i = 0; i < samples_to_do; ++i) {
+#else
         for (size_t i = 0; i < sizeof(mix_buffer) / sizeof(*mix_buffer); ++i) {
+#endif
             const Sint16 max_audioval = ((1 << (16 - 1)) - 1);
             const Sint16 min_audioval = -(1 << (16 - 1));
 
@@ -392,7 +491,7 @@ void ProcessAudioPlayback(void *userdata, Uint8 *stream, int len)
     }
 }
 
-#if RETRO_USING_SDL1 || RETRO_USING_SDL2
+#if RETRO_USING_SDL1 || RETRO_USING_SDL2 || RETRO_USING_KOS
 void ProcessAudioMixing(Sint32 *dst, const Sint16 *src, int len, int volume, sbyte pan)
 {
     if (volume == 0)
@@ -437,6 +536,47 @@ void ProcessAudioMixing(Sint32 *dst, const Sint16 *src, int len, int volume, sby
 
 void LoadMusic(void *userdata)
 {
+#if RETRO_USING_KOS
+    // Dreamcast: stream raw 8-bit PCM straight from the loose file on the CD
+    // (bypassing the datafile), no vorbis decode. Music must be present at
+    // /cd/Data/Music/*.ogg (raw s8, per the conversion scripts).
+    LockAudioDevice();
+
+    // Mirror of the vorbis path's musicStartPos handling below. SwapMusicTrack
+    // (speed shoes on/off, invincibility starting/ending) sets musicStartPos so
+    // the incoming track picks up where the outgoing one left off, scaled by
+    // musicRatio because the "_F" twins run at a different tempo — 8000 is 0.8,
+    // 12500 is 1.25, and the divisor is 10,000. Without this the DC branch
+    // restarted every swap from zero, so grabbing an invincibility box and
+    // waiting it out dropped you back at the top of the stage theme.
+    //
+    // The read has to happen BEFORE DC_MusicClose(), which drops the handle the
+    // position is measured from.
+    uint dcStartPos = 0;
+    if (musicStartPos) {
+        float newPos = (float)DC_MusicTell() * ((float)musicRatio * 0.0001f);
+        if (newPos > 0.0f)
+            dcStartPos = (uint)newPos; // DC_MusicOpen wraps this into the new track
+    }
+
+    DC_MusicClose();
+    char dcPath[0x120];
+    sprintf(dcPath, "%s%s", BASE_PATH, musicTracks[currentMusicTrack].fileName);
+    if (DC_MusicOpen(dcPath, musicTracks[currentMusicTrack].trackLoop, musicTracks[currentMusicTrack].loopPoint, dcStartPos)) {
+        musicStatus  = MUSIC_PLAYING;
+        masterVolume = MAX_VOLUME;
+        trackID      = currentMusicTrack;
+    }
+    else {
+        musicStatus = MUSIC_STOPPED;
+    }
+    musicStartPos     = 0;
+    currentMusicTrack = -1;
+    musicPosition     = 0;
+    UnlockAudioDevice();
+    return;
+#endif
+
     int oldStreamID = currentStreamIndex;
     currentStreamIndex++;
     currentStreamIndex %= STREAMFILE_COUNT;
@@ -456,9 +596,27 @@ void LoadMusic(void *userdata)
         if (info.vfileSize > MUSBUFFER_SIZE)
             musFile->fileSize = MUSBUFFER_SIZE;
 
+#if RETRO_USING_KOS
+        {
+            // stream the file into VRAM through a small staging buffer
+            // (VRAM only tolerates 32-bit accesses)
+            static byte staging[0x2000] __attribute__((aligned(4)));
+            int remaining = musFile->fileSize;
+            uint writePos = 0;
+            while (remaining > 0) {
+                int chunk = remaining > (int)sizeof(staging) ? (int)sizeof(staging) : remaining;
+                FileRead(staging, chunk);
+                DC_VramWrite(musFile->vramBase + writePos, staging, chunk);
+                writePos += chunk;
+                remaining -= chunk;
+            }
+        }
+#else
         FileRead(streamFile[currentStreamIndex].buffer, musFile->fileSize);
+#endif
         CloseFile();
 
+#if !RETRO_USING_KOS
         unsigned long long samples = 0;
         ov_callbacks callbacks;
 
@@ -470,7 +628,12 @@ void LoadMusic(void *userdata)
         int error = ov_open_callbacks(musFile, &strmInfo->vorbisFile, NULL, 0, callbacks);
         if (error == 0) {
             strmInfo->vorbBitstream = -1;
+#if RETRO_USING_KOS
+            // tremor: vorbisFile.vi is an embedded struct maintained by the
+            // library itself — nothing to assign (use ov_info() to read it)
+#else
             strmInfo->vorbisFile.vi = ov_info(&strmInfo->vorbisFile, -1);
+#endif
 
             samples = (unsigned long long)ov_pcm_total(&strmInfo->vorbisFile, -1);
 
@@ -520,6 +683,7 @@ void LoadMusic(void *userdata)
                 case OV_EFAULT: PrintLog("Vorbis open error: Internal logic fault; indicates a bug or heap / stack corruption"); break;
             }
         }
+#endif // !RETRO_USING_KOS
     }
     else {
         musicStatus = MUSIC_STOPPED;
@@ -611,9 +775,130 @@ void LoadSfx(char *filePath, byte sfxID)
     StrCopy(fullPath, "Data/SoundFX/");
     StrAdd(fullPath, filePath);
 
+#if RETRO_USING_KOS
+    // A loose raw-PCM copy next to Data.rsdk wins over the packed .ogg. This
+    // has to happen BEFORE LoadFile: LoadFile MD5-resolves the datapack first
+    // and its loose-file fallback never runs, so the loose file would never
+    // be seen otherwise (the same reason DC_NativeTryLoadDtex bypasses it).
+    //
+    // GLOBAL sfx only, deliberately. Stage sfx are packed .wav that route into
+    // AICA sound RAM, that path is working, and nothing dropped on the disc
+    // should be able to divert it. The ID range test is the same one used
+    // below and is only this simple because RETRO_MOD_LOADER is forced OFF on
+    // DC — see the longer note in the 'w' branch.
+    if (sfxID < globalSFXCount || sfxID >= globalSFXCount + stageSFXCount) {
+        size_t  rawSamples  = 0;
+        int     rawRate     = 0;
+        int     rawChannels = 0;
+        Sint16 *raw         = DC_LoadRawSfx(fullPath, &rawSamples, &rawRate, &rawChannels);
+        if (raw) {
+            LockAudioDevice();
+            StrCopy(sfxList[sfxID].name, filePath);
+            sfxList[sfxID].buffer   = raw;
+            sfxList[sfxID].length   = rawSamples;
+            sfxList[sfxID].rate     = rawRate;
+            sfxList[sfxID].channels = (byte)rawChannels;
+            sfxList[sfxID].loaded   = true;
+            UnlockAudioDevice();
+            return;
+        }
+    }
+#endif
+
     if (LoadFile(fullPath, &info)) {
 #if !RETRO_USE_ORIGINAL_CODE
         byte type = fullPath[StrLength(fullPath) - 3];
+#if RETRO_USING_KOS
+        if (type == 'w') {
+            // Streamed rather than slurped: the old path held the whole file, a
+            // full-rate S16 copy and the half-rate copy live at once, needing
+            // ~5 bytes free for every 1 it kept. That is fine at boot when the
+            // global sfx load onto an empty heap, and not fine at stage load,
+            // where the bigger Data/SoundFX/Stage/ wavs were the ones failing.
+            // DC_LoadWAVStreamed reads through the open file and decimates
+            // straight into the final buffer, so peak == kept.
+            //
+            // Stage sfx additionally come out of a bump arena rather than the
+            // heap (see the arena block in DCAudio.cpp): reloading a whole
+            // differently-sized set on every stage change fragments the free
+            // list, and Hidden Palace's 23 buffers were failing at the tail.
+            // The ID range test below is exactly the range ReleaseStageSfx
+            // frees. It is only this simple because RETRO_MOD_LOADER is forced
+            // OFF for DC in platforms/KallistiOS.cmake — the mod loader is the
+            // one caller that bumps globalSFXCount after each LoadSfx, which
+            // would otherwise make the two ranges overlap. stageSFXCount is set
+            // in Scene.cpp before its LoadSfx loop, so it is valid here.
+            size_t sampleCount = 0;
+            int wavRate        = 0;
+            int wavChannels    = 0;
+            const bool isStageSfx = sfxID >= globalSFXCount && sfxID < globalSFXCount + stageSFXCount;
+
+            // Stage sfx go to the AICA's own 2MB of sound RAM before they go to
+            // the heap at all. Hidden Palace's set wants 1.4MB and the heap has
+            // ~830KB left by then, so on that zone the arena below cannot win
+            // however it is arranged — see the AICA block at the bottom of
+            // DCAudio.cpp. Anything the AICA won't take (bad format, sound RAM
+            // full, staging refused) falls through to the arena exactly as
+            // before, so no zone can regress.
+            if (isStageSfx && DC_AicaSfxLoad(info.vfileSize, sfxID)) {
+                CloseFile();
+
+                LockAudioDevice();
+                StrCopy(sfxList[sfxID].name, filePath);
+                // NULL buffer is the marker: the software mixer already skips a
+                // channel whose samplePtr is NULL, so an AICA-resident sfx costs
+                // it nothing and needs no test of its own in the mix loop.
+                sfxList[sfxID].buffer   = NULL;
+                sfxList[sfxID].length   = 0;
+                sfxList[sfxID].rate     = 0;
+                sfxList[sfxID].channels = 0;
+                sfxList[sfxID].loaded   = true;
+                UnlockAudioDevice();
+                return;
+            }
+
+            // The AICA attempt consumed the header, so rewind before the heap
+            // loader walks the same chunks again.
+            if (isStageSfx)
+                SetFilePosition(0);
+
+            Sint16 *samples = DC_LoadWAVStreamed(info.vfileSize, &sampleCount, &wavRate, &wavChannels, isStageSfx);
+            CloseFile();
+
+            if (!samples) {
+                PrintLog("Unable to read sfx: %s", info.fileName);
+                sfxList[sfxID].loaded = false;
+            }
+            else {
+                LockAudioDevice();
+                StrCopy(sfxList[sfxID].name, filePath);
+                sfxList[sfxID].buffer   = samples;
+                sfxList[sfxID].length   = sampleCount;
+                sfxList[sfxID].rate     = wavRate;
+                sfxList[sfxID].channels = (byte)wavChannels;
+                sfxList[sfxID].loaded   = true;
+                UnlockAudioDevice();
+            }
+        }
+        else if (type == 'o') {
+            // Vorbis sfx can no longer be decoded on Dreamcast — libtremor is
+            // gone (see the note in RetroEngine.hpp). Getting here means this
+            // .ogg had no loose raw-PCM copy beside Data.rsdk for
+            // DC_LoadRawSfx to pick up, so it simply cannot be played.
+            //
+            // Deliberately loud rather than silent: a missed conversion is a
+            // one-line fix on the asset side, and a sound that vanishes with
+            // no explanation costs a rebuild to diagnose.
+            CloseFile();
+            PrintLog("Sfx '%s' is packed Vorbis with no loose raw copy - not loaded", info.fileName);
+            sfxList[sfxID].loaded = false;
+        }
+        else {
+            // wtf lol
+            CloseFile();
+            PrintLog("Sfx format not supported!");
+        }
+#else
         if (type == 'w') {
             byte *sfx = new byte[info.vfileSize];
             FileRead(sfx, info.vfileSize);
@@ -770,11 +1055,21 @@ void LoadSfx(char *filePath, byte sfxID)
             CloseFile();
             PrintLog("Sfx format not supported!");
         }
+#endif // RETRO_USING_KOS
 #endif
     }
 }
 void PlaySfx(int sfx, bool loop)
 {
+#if RETRO_USING_KOS
+    // An sfx living in AICA sound RAM takes no sfxChannels[] slot at all. That
+    // is deliberate: its buffer is NULL, so the software mixer never runs the
+    // branch that clears a finished channel, and a slot handed to it would
+    // never come back — until the search below found nothing free, left
+    // sfxChannelID at -1, and wrote to sfxChannels[-1].
+    if (DC_AicaSfxPlay(sfx, loop))
+        return;
+#endif
     LockAudioDevice();
     int sfxChannelID = -1;
     for (int c = 0; c < CHANNEL_COUNT; ++c) {
@@ -790,10 +1085,17 @@ void PlaySfx(int sfx, bool loop)
     sfxInfo->sampleLength = sfxList[sfx].length;
     sfxInfo->loopSFX      = loop;
     sfxInfo->pan          = 0;
+#if RETRO_USING_KOS
+    sfxInfo->stepPos      = 0;
+#endif
     UnlockAudioDevice();
 }
 void SetSfxAttributes(int sfx, int loopCount, sbyte pan)
 {
+#if RETRO_USING_KOS
+    if (DC_AicaSfxSetAttr(sfx, loopCount, pan))
+        return;
+#endif
     LockAudioDevice();
     int sfxChannel = -1;
     for (int i = 0; i < CHANNEL_COUNT; ++i) {

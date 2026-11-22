@@ -1,5 +1,9 @@
 #include "RetroEngine.hpp"
 
+#if RETRO_USING_KOS
+#include "Dreamcast/DCSave.hpp" // saves go to the VMU (the disc is read-only)
+#endif
+
 int globalVariablesCount;
 int globalVariables[GLOBALVAR_COUNT];
 char globalVariableNames[GLOBALVAR_COUNT][0x20];
@@ -45,6 +49,9 @@ bool useSGame = false;
 bool ReadSaveRAMData()
 {
     useSGame = false;
+#if RETRO_USING_KOS
+    return DC_LoadSaveRAM(); // read from the VMU, not the read-only disc
+#endif
     char buffer[0x180];
 #if RETRO_USE_MOD_LOADER
 #if RETRO_PLATFORM == RETRO_UWP
@@ -116,6 +123,9 @@ bool ReadSaveRAMData()
 
 bool WriteSaveRAMData()
 {
+#if RETRO_USING_KOS
+    return DC_StoreSaveRAM(); // write to the VMU, not the read-only disc
+#endif
     char buffer[0x180];
 
     if (!useSGame) {
@@ -628,6 +638,13 @@ void InitUserdata()
     }
 #endif
 
+#if RETRO_USING_KOS
+    // The DC keeps userdata on the VMU, not on the read-only disc. Always LOAD
+    // at boot (never the file-existence "else -> write" path, which would wipe an
+    // existing VMU save before it was read). ReadUserdata() no-ops cleanly when
+    // no card/save is present.
+    ReadUserdata();
+#else
 #if RETRO_PLATFORM == RETRO_UWP
     if (!usingCWD)
         sprintf(buffer, "%s/UData.bin", getResourcesPath());
@@ -646,6 +663,7 @@ void InitUserdata()
     else {
         WriteUserdata();
     }
+#endif
 }
 
 void WriteSettings()
@@ -797,6 +815,10 @@ void WriteSettings()
 
 void ReadUserdata()
 {
+#if RETRO_USING_KOS
+    DC_LoadUserdata(); // read achievements + records from the VMU
+    return;
+#endif
     char buffer[0x100];
 #if RETRO_USE_MOD_LOADER
 #if RETRO_PLATFORM == RETRO_UWP
@@ -850,6 +872,10 @@ void ReadUserdata()
 
 void WriteUserdata()
 {
+#if RETRO_USING_KOS
+    DC_StoreUserdata(); // write achievements + records to the VMU
+    return;
+#endif
     char buffer[0x100];
 #if RETRO_USE_MOD_LOADER
 #if RETRO_PLATFORM == RETRO_UWP

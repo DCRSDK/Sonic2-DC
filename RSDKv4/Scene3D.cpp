@@ -1,5 +1,9 @@
 #include "RetroEngine.hpp"
 
+#if RETRO_USING_KOS
+#include <algorithm> // std::sort — replaces the O(n^2) draw-list sort on DC
+#endif
+
 int vertexCount = 0;
 int faceCount   = 0;
 
@@ -319,6 +323,16 @@ void Sort3DDrawList()
         drawList3D[i].faceID = i;
     }
 
+#if RETRO_USING_KOS
+    // The stock sort below is an O(n^2) bubble sort. With the special-stage
+    // half-pipe now hardware-rendered on DC, the SH4 CPU is the bottleneck and
+    // this sort (hundreds of faces every frame) is a big chunk of it. Replace
+    // it with std::stable_sort (O(n log n), and stable so equal-depth faces
+    // keep their original order — identical result to the bubble sort). Sorts
+    // farthest-first (descending depth) for the painter's-order draw.
+    std::stable_sort(drawList3D, drawList3D + faceCount,
+                     [](const DrawListEntry3D &a, const DrawListEntry3D &b) { return a.depth > b.depth; });
+#else
     for (int i = 0; i < faceCount; ++i) {
         for (int j = faceCount - 1; j > i; --j) {
             if (drawList3D[j].depth > drawList3D[j - 1].depth) {
@@ -331,6 +345,7 @@ void Sort3DDrawList()
             }
         }
     }
+#endif
 }
 void Draw3DScene(int spriteSheetID)
 {

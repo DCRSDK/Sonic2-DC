@@ -621,6 +621,48 @@ void LoadStageFiles(void)
         ClearScriptData();
         for (int i = SURFACE_COUNT; i > 0; i--) RemoveGraphicsFile((char *)"", i - 1);
 
+#if RETRO_USING_KOS
+        // Dreamcast only. Right here is the emptiest the heap gets once the game
+        // is running: the previous stage's sfx, scripts and sheets have all just
+        // been let go and nothing new has been read yet.
+        DC_HeapReport("stage load, entry");
+
+        // Except for one thing, which nothing ever let go of. The native "2013"
+        // menu malloc's its models the first time it builds itself and holds them
+        // for the whole run — Intro, Box, BGLines, TimeAttack and the rest come
+        // to about 620KB resident. During a stage that is dead weight: gameplay
+        // draws none of it, and the pause menu's own models (Button, ButtonH,
+        // Panel — some 8KB between them) are re-read on demand anyway.
+        //
+        // Handing it back here does two things at once. It is 620KB the stage
+        // sfx can have, and freeing it alongside the sheets and scripts released
+        // just above coalesces the free list rather than leaving the arena to
+        // pick its way around permanent allocations — which is what left the
+        // largest free block at 240KB while over a megabyte sat free in total.
+        //
+        // EvictMeshData, not ClearMeshData. Both free the geometry; only the
+        // first keeps each slot's fileName, and that turned out to be the whole
+        // ball game. Clearing the names let LoadMesh re-pack meshList from slot 0
+        // in whatever order the NEXT menu asked - the pause menu asks for
+        // BGCircle1/2, BGLines, Button, ButtonH, Panel, which is not the order
+        // the main menu built - and then RestoreNativeObjects() memcpy'd the main
+        // menu's entities back in holding their original MeshInfo* pointers. The
+        // menu returned from a stage drawing a button where its background circle
+        // belongs. Keeping the names keeps every slot pointing at its own model;
+        // the geometry is read back when something asks to draw it.
+        EvictMeshData();
+
+        // Now claim the stage-SFX arena, before the scripts and sheets below
+        // carve the free list up again — Hidden Palace needs ~1.4MB across 23
+        // buffers and it is the tail of that set that used to fail. Whatever the
+        // arena can't get, stage sfx fall back to plain malloc for, i.e. the old
+        // behaviour, and it says so in the log.
+        // (Not done at audio init: that starves the native menu's models.)
+        DC_SfxArenaAcquire();
+
+        DC_HeapReport("stage load, post-arena");
+#endif
+
 #if RETRO_USE_MOD_LOADER
         loadGlobalScripts = false;
 #else
@@ -750,6 +792,14 @@ void LoadStageFiles(void)
                 LoadSfx(strBuffer, globalSFXCount + i);
                 SetFileInfo(&infoStore);
             }
+
+#if RETRO_USING_KOS
+            // The set that used to fail silently. Pair this line with the
+            // "[DCSfx] stage arena" line above it: if any sfx is missing, either
+            // the arena came up short or a buffer spilled to a heap that had
+            // nothing left.
+            DC_HeapReport("stage load, post-sfx");
+#endif
 
             byte stageObjectCount = 0;
             FileRead(&stageObjectCount, 1);
@@ -1383,8 +1433,26 @@ void LoadStageGIFFile(int stageID)
                 tilesetGFXData[i] = 0;
         }
 
+#if RETRO_USING_KOS
+        // Mirror the fresh tileset into PVR VRAM NOW, while the loading
+        // screen is up — deferring to the first flip put the 256KB upload on
+        // the stage's first visible frame (a hitch at title-card time).
+        DC_UploadTilesetNow();
+
+        // Keep the Sonic 2 emblem on every connected VMU's LCD (stage loads
+        // double as the re-assert point for hot-swapped VMUs).
+        DC_VmuShowIcon();
+#endif
+
         CloseFile();
     }
+#if RETRO_USING_KOS
+    else {
+        // If this fires, the stage keeps the PREVIOUS stage's tiles in both
+        // RAM and VRAM (the reported Hidden Palace symptom) — log loudly.
+        PrintLog("[DC] 16x16Tiles.gif LOAD FAILED (stage %d) — tileset is STALE", stageID);
+    }
+#endif
 }
 
 void ResetBackgroundSettings()

@@ -1,4 +1,7 @@
 #include "RetroEngine.hpp"
+#if RETRO_USING_KOS
+#include "Dreamcast/DCSave.hpp"
+#endif
 
 byte timeAttackTex;
 
@@ -85,6 +88,9 @@ void TimeAttack_Create(void *objPtr)
 
     if (saveRAMUpdated)
         WriteSaveRAMData();
+#if RETRO_USING_KOS
+        DC_FlushSaves(); // menu-side write - see SettingsScreen.cpp for why
+#endif
 
     int pos = 0;
     float x = -72.0;

@@ -1,5 +1,9 @@
 #include "RetroEngine.hpp"
 
+#if RETRO_USING_KOS
+#include "Dreamcast/DCCommon.hpp"
+#endif
+
 struct GifDecoder {
     int depth;
     int clearCode;
@@ -220,6 +224,11 @@ int AddGraphicsFile(const char *filePath)
         case 'r': LoadPVRFile(sheetPath, sheetID); break;
     }
 
+#if RETRO_USING_KOS
+    // Mirror the freshly-loaded sheet into PVR VRAM for hardware sprites.
+    DC_UploadSheet(sheetID);
+#endif
+
     return sheetID;
 }
 void RemoveGraphicsFile(const char *filePath, int sheetID)
@@ -232,6 +241,12 @@ void RemoveGraphicsFile(const char *filePath, int sheetID)
     }
 
     if (sheetID >= 0 && StrLength(gfxSurface[sheetID].fileName)) {
+#if RETRO_USING_KOS
+        // Free this slot's VRAM texture. The pool compaction below only moves
+        // other sheets' bytes (their textures are independent VRAM copies and
+        // stay valid), so only the removed slot needs invalidating.
+        DC_InvalidateSheet(sheetID);
+#endif
         StrCopy(gfxSurface[sheetID].fileName, "");
         int dataPosStart = gfxSurface[sheetID].dataPosition;
         int dataPosEnd   = gfxSurface[sheetID].dataPosition + gfxSurface[sheetID].height * gfxSurface[sheetID].width;

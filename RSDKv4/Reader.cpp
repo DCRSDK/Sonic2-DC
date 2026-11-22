@@ -4,7 +4,7 @@
 RSDKContainer rsdkContainer;
 
 char fileName[0x100];
-byte fileBuffer[0x2000];
+byte fileBuffer[FILEBUFFER_SIZE];
 int fileSize          = 0;
 int vFileSize         = 0;
 int readPos           = 0;
@@ -12,6 +12,10 @@ int readSize          = 0;
 int bufferPosition    = 0;
 int virtualFileOffset = 0;
 bool useEncryption    = false;
+#if RETRO_USING_KOS
+uint dcReadBytes = 0;
+uint dcReadCalls = 0;
+#endif
 byte packID           = 0;
 byte eStringPosA;
 byte eStringPosB;
@@ -21,6 +25,72 @@ byte encryptionStringA[0x10];
 byte encryptionStringB[0x10];
 
 FileIO *cFileHandle = nullptr;
+
+#if RETRO_USING_KOS
+// ---------------------------------------------------------------------------
+// GD-ROM: give every file we read a big, 32-byte-aligned stdio buffer.
+//
+// KOS's iso_fstat() reports st_blksize = 512, and newlib's __swhatbuf_r() sizes
+// each FILE*'s buffer from exactly that field, so by default every stream on
+// /cd refills 512 bytes at a time out of a malloc'd (8-byte-aligned) buffer.
+// That is the worst possible shape for this drive, for two reasons.
+//
+// First, iso_read() has three tiers, and the good ones are gated on alignment:
+//
+//     if((thissect & 31) == 0 && toread >= 32 && (((uintptr_t)outbuf) & 31) == 0)
+//
+// Only inside that branch does it use the drive's streaming engine
+// (cdrom_stream_start/cdrom_stream_request), which keeps a sequential DMA read
+// running ahead of us for the whole remainder of the file. The fallback path,
+// read_loop, has its own multi-sector short-circuit - and that one *also*
+// requires __is_aligned(outbuf, 32). Miss the alignment and every read of any
+// size degrades to one bdread() per 2048-byte sector: a single-sector
+// cdrom_read_sectors_ex through a 16-block LRU cache, one drive transaction at
+// a time. A buffer newlib malloc'd is 8-byte aligned, so today we are almost
+// certainly never taking either fast path.
+//
+// Second - and this is the expensive one - bread_cache() calls
+// iso_abort_stream() on every cache miss, and iso_seek() aborts on every
+// position change. There is exactly one stream_fd for the whole filesystem. So
+// each slow-path read does not merely cost a transaction, it tears down the
+// read-ahead stream that another file (notably the music the reader thread in
+// DCAudio.cpp is pulling) had running. Sixteen 512-byte reads where one 16 KB
+// read would do is sixteen chances to stop the drive streaming and make the
+// head go somewhere else.
+//
+// One 32-byte-aligned buffer therefore buys three separate things: the fast
+// paths become reachable at all, FillFileBuffer's 0x2000-byte request stops
+// being decomposed into sixteen syscalls, and fh_mutex is taken once per
+// refill instead of once per 512 bytes - which is also sixteen fewer windows
+// for the music thread to interleave.
+//
+// Sharing one static buffer between opens is safe here: Reader.cpp reads
+// through the single global cFileHandle above, and LoadFile() closes the
+// previous handle before opening the next, so only one stream is ever actually
+// read. It is also safe to hand newlib a static: setvbuf() clears __SMBF, so
+// fclose() will not try to free it.
+//
+// Size is a deliberate compromise. 0x4000 covers two FillFileBuffer refills per
+// underlying read while costing 16 KB of BSS - and BSS comes out of the same
+// pool as the stage-load heap, which is documented tight (largest hole ~372 KB).
+// The DCAudio.cpp reader thread gave 8 KB back by dropping its bounce buffer,
+// so the net cost across both changes is about 8 KB.
+// ---------------------------------------------------------------------------
+#define DC_CD_STDIO_BUF_SIZE (0x4000)
+static byte __attribute__((aligned(32))) dcCdStdioBuf[DC_CD_STDIO_BUF_SIZE];
+
+static inline void DC_TuneCDStream(FileIO *f)
+{
+    if (!f)
+        return;
+
+    // Must happen before any I/O on the stream, which is why every call site
+    // sits directly under its fOpen and above the first fSeek.
+    setvbuf(f, (char *)dcCdStdioBuf, _IOFBF, DC_CD_STDIO_BUF_SIZE);
+}
+#else
+#define DC_TuneCDStream(f) ((void)0)
+#endif
 
 bool CheckRSDKFile(const char *filePath)
 {
@@ -36,6 +106,7 @@ bool CheckRSDKFile(const char *filePath)
 #endif
 
     cFileHandle = fOpen(filePathBuffer, "rb");
+    DC_TuneCDStream(cFileHandle);
     if (cFileHandle) {
         byte signature[6] = { 'R', 'S', 'D', 'K', 'v', 'B' };
         byte buf          = 0;
@@ -205,6 +276,7 @@ bool LoadFile(const char *filePath, FileInfo *fileInfo)
         RSDKFileInfo *file = &rsdkContainer.files[fileIndex];
         packID      = file->packID;
         cFileHandle = fOpen(rsdkContainer.packNames[file->packID], "rb");
+        DC_TuneCDStream(cFileHandle);
         if (cFileHandle) {
             fSeek(cFileHandle, 0, SEEK_END);
             fileSize = (int)fTell(cFileHandle);
@@ -214,7 +286,7 @@ bool LoadFile(const char *filePath, FileInfo *fileInfo)
             readPos           = file->offset;
             readSize          = 0;
             bufferPosition    = 0;
-            fSeek(cFileHandle, virtualFileOffset, SEEK_SET);
+            DC_SEEK_SET(cFileHandle, virtualFileOffset);
 
             useEncryption = file->encrypted;
             memset(fileInfo->encryptionStringA, 0, 0x10 * sizeof(byte));
@@ -270,6 +342,7 @@ bool LoadFile(const char *filePath, FileInfo *fileInfo)
 
             packID      = file->packID;
             cFileHandle = fOpen(rsdkContainer.packNames[file->packID], "rb");
+            DC_TuneCDStream(cFileHandle);
             if (cFileHandle) {
                 fSeek(cFileHandle, 0, SEEK_END);
                 fileSize = (int)fTell(cFileHandle);
@@ -279,7 +352,7 @@ bool LoadFile(const char *filePath, FileInfo *fileInfo)
                 readPos           = file->offset;
                 readSize          = 0;
                 bufferPosition    = 0;
-                fSeek(cFileHandle, virtualFileOffset, SEEK_SET);
+                DC_SEEK_SET(cFileHandle, virtualFileOffset);
 
                 useEncryption = file->encrypted;
                 memset(fileInfo->encryptionStringA, 0, 0x10 * sizeof(byte));
@@ -323,6 +396,7 @@ bool LoadFile(const char *filePath, FileInfo *fileInfo)
         StrCopy(fileName, fileInfo->fileName);
 
         cFileHandle = fOpen(fileInfo->fileName, "rb");
+        DC_TuneCDStream(cFileHandle);
         if (!cFileHandle) {
             PrintLog("Couldn't load file '%s'", filePath);
             return false;
@@ -331,6 +405,11 @@ bool LoadFile(const char *filePath, FileInfo *fileInfo)
         fSeek(cFileHandle, 0, SEEK_END);
         fileInfo->fileSize = (int)fTell(cFileHandle);
         fileSize = fileInfo->vfileSize = fileInfo->fileSize;
+        // The GLOBAL vFileSize was never set here, only the per-file copy, so it
+        // stayed at whatever the last packed entry left behind. Nothing read it
+        // on this path before (it only feeds the encryption keys, and loose
+        // files are not encrypted) but FillFileBuffer's clamp does now.
+        vFileSize = fileSize;
         fSeek(cFileHandle, 0, SEEK_SET);
         readPos           = 0;
         fileInfo->readPos = readPos;
@@ -348,6 +427,15 @@ bool LoadFile(const char *filePath, FileInfo *fileInfo)
         return true;
     }
 }
+
+#if !RETRO_USE_ORIGINAL_CODE
+// See FillFileBuffer in Reader.hpp. Kept out of line so the header does not have
+// to reach for PrintLog, which is declared in a header included after it.
+void ReportShortFileRead(int got, int want, int at)
+{
+    PrintLog("FileRead: SHORT READ, got %d of %d bytes at %d in '%s' - the rest is zeroed", got, want, at, fileName);
+}
+#endif
 
 void GenerateELoadKeys(uint key1, uint key2)
 {
@@ -555,13 +643,14 @@ void SetFileInfo(FileInfo *fileInfo)
     if (Engine.usingDataFile) {
 #endif
         cFileHandle = fOpen(rsdkContainer.packNames[fileInfo->packID], "rb");
+        DC_TuneCDStream(cFileHandle);
         if (cFileHandle) {
             virtualFileOffset = fileInfo->virtualFileOffset;
             vFileSize         = fileInfo->vfileSize;
             fSeek(cFileHandle, 0, SEEK_END);
             fileSize = (int)fTell(cFileHandle);
             readPos  = fileInfo->readPos;
-            fSeek(cFileHandle, readPos, SEEK_SET);
+            DC_SEEK_SET(cFileHandle, readPos);
             FillFileBuffer();
             bufferPosition       = fileInfo->bufferPosition;
             eStringPosA          = fileInfo->eStringPosA;
@@ -580,10 +669,12 @@ void SetFileInfo(FileInfo *fileInfo)
     else {
         StrCopy(fileName, fileInfo->fileName);
         cFileHandle       = fOpen(fileInfo->fileName, "rb");
+        DC_TuneCDStream(cFileHandle);
         virtualFileOffset = 0;
         fileSize          = fileInfo->fileSize;
+        vFileSize         = fileSize; // same reason as in LoadFile above
         readPos           = fileInfo->readPos;
-        fSeek(cFileHandle, readPos, SEEK_SET);
+        DC_SEEK_SET(cFileHandle, readPos);
         FillFileBuffer();
         bufferPosition       = fileInfo->bufferPosition;
         eStringPosA          = 0;
@@ -661,7 +752,7 @@ void SetFilePosition(int newPos)
         else
             readPos = newPos;
     }
-    fSeek(cFileHandle, readPos, SEEK_SET);
+    DC_SEEK_SET(cFileHandle, readPos);
     FillFileBuffer();
 }
 

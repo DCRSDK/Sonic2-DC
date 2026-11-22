@@ -2,7 +2,13 @@
 #define DRAWING_H
 
 #define SURFACE_COUNT (24)
+#if RETRO_USING_KOS
+// Dreamcast: 3MB sprite-sheet pool (16MB total RAM); Sonic 1/2 sheets fit
+// comfortably. Sprite.cpp resets gfxDataPosition on overflow.
+#define GFXDATA_SIZE (0x300000)
+#else
 #define GFXDATA_SIZE  (0x800 * 0x800)
+#endif
 
 #if RETRO_REV03
 #define DRAWLAYER_COUNT (8)
@@ -80,8 +86,16 @@ void ReleaseRenderDevice(bool refresh = false);
 
 void GenerateBlendLookupTable();
 
+#if RETRO_USING_KOS
+void DC_InvalidateAllSheets(); // free all PVR sheet textures (Dreamcast/DCGraphics.cpp)
+#endif
 inline void ClearGraphicsData()
 {
+#if RETRO_USING_KOS
+    // Every sheet slot is about to be zeroed; free the mirrored VRAM textures
+    // so a stage change doesn't leak PVR memory.
+    DC_InvalidateAllSheets();
+#endif
     for (int i = 0; i < SURFACE_COUNT; ++i) MEM_ZERO(gfxSurface[i]);
     gfxDataPosition = 0;
 }

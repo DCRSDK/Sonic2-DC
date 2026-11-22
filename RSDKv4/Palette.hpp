@@ -30,7 +30,9 @@ extern int GFX_LINESIZE_DOUBLE;
 extern int GFX_FRAMEBUFFERSIZE;
 extern int GFX_FBUFFERMINUSONE;
 
+#if RETRO_USING_OPENGL
 extern uint gfxPalette16to32[0x10000];
+#endif
 
 extern int fadeMode;
 extern byte fadeA;

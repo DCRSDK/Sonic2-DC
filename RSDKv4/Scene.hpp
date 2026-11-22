@@ -251,12 +251,34 @@ inline void Init3DFloorBuffer(int layerID)
     }
 }
 
+#if RETRO_USING_KOS
+// Dreamcast: the tileset is mirrored into PVR VRAM for hardware high-plane
+// tiles (DCGraphics.cpp). Tile copies do NOT re-upload the texture — stage
+// scripts animate tiles by copying every frame (EHZ flowers, CPZ conveyors)
+// and a 256KB re-twiddle per frame stutters hard. Instead the copy just
+// updates a UV indirection table; the texture keeps the original pixels.
+void DC_RemapTile(int dest, int src);
+// Full re-mirror at the next flip — stage load only (see LoadStageGIFFile).
+void DC_MarkTilesetDirty();
+// Immediate re-mirror during stage load (loading screen up, no visible hitch).
+void DC_UploadTilesetNow();
+// VMU LCD icon push (DCSystem.cpp); re-asserted on stage loads.
+void DC_VmuShowIcon();
+// Free heap / hole count / largest hole to the log (DCAudio.cpp). The stage
+// load is where the heap is fought over hardest, so it is bracketed with these.
+void DC_HeapReport(const char *tag);
+#endif
+
 inline void Copy16x16Tile(ushort dest, ushort src)
 {
     byte *destPtr = &tilesetGFXData[TILELAYER_CHUNK_W * dest];
     byte *srcPtr  = &tilesetGFXData[TILELAYER_CHUNK_W * src];
     int cnt       = TILE_DATASIZE;
     while (cnt--) *destPtr++ = *srcPtr++;
+
+#if RETRO_USING_KOS
+    DC_RemapTile(dest, src);
+#endif
 }
 
 void SetLayerDeformation(int selectedDef, int waveLength, int waveWidth, int waveType, int YPos, int waveSize);

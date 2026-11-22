@@ -1,4 +1,6 @@
 #include "RetroEngine.hpp"
+#include "Dreamcast/DCCommon.hpp"
+#include <cstdarg>
 
 bool endLine   = true;
 int touchFlags = 0;
@@ -23,6 +25,11 @@ void PrintLog(const char *msg, ...)
             printf("%s", buffer);
             sprintf(buffer, "%s", buffer);
         }
+#if RETRO_USING_KOS
+        // newlib buffers stdout on KOS; without this the log never reaches
+        // the serial console
+        fflush(stdout);
+#endif
 
         if (engineDebugMode) {
             char pathBuffer[0x100];
@@ -109,6 +116,13 @@ void InitDevMenu()
     SetActivePalette(0, 0, 256);
     textMenuSurfaceNo = SURFACE_COUNT - 1;
     LoadGIFFile("Data/Game/SystemText.gif", SURFACE_COUNT - 1);
+#if RETRO_USING_KOS
+    // The dev menu font is loaded via LoadGIFFile directly (not through
+    // AddGraphicsFile, where the hardware-sprite mirror hook lives), so the
+    // sheet never reaches PVR VRAM — and every DrawSprite for menu text
+    // silently no-ops, leaving the dev menu blank. Mirror it explicitly.
+    DC_UploadSheet(SURFACE_COUNT - 1);
+#endif
     SetPaletteEntry(-1, 1, 0x00, 0x00, 0x00);
     SetPaletteEntry(-1, 8, 0x80, 0x80, 0x80);
     SetPaletteEntry(-1, 0xF0, 0x00, 0x00, 0x00);
@@ -137,6 +151,13 @@ void InitErrorMessage()
     SetActivePalette(0, 0, 256);
     textMenuSurfaceNo = SURFACE_COUNT - 1;
     LoadGIFFile("Data/Game/SystemText.gif", SURFACE_COUNT - 1);
+#if RETRO_USING_KOS
+    // The dev menu font is loaded via LoadGIFFile directly (not through
+    // AddGraphicsFile, where the hardware-sprite mirror hook lives), so the
+    // sheet never reaches PVR VRAM — and every DrawSprite for menu text
+    // silently no-ops, leaving the dev menu blank. Mirror it explicitly.
+    DC_UploadSheet(SURFACE_COUNT - 1);
+#endif
     SetPaletteEntry(-1, 1, 0x00, 0x00, 0x00);
     SetPaletteEntry(-1, 8, 0x80, 0x80, 0x80);
     SetPaletteEntry(-1, 0xF0, 0x00, 0x00, 0x00);

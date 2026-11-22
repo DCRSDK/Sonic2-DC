@@ -3394,6 +3394,21 @@ void ProcessScript(int scriptCodeStart, int jumpTableStart, byte scriptEvent)
                 // If we're using the scripts or an Origins datafile, check the array value
                 if (forceUseScripts || Engine.usingOrigins)
                     inputCheck = arrayVal <= 1;
+
+                // Input slots: 1 is player 1 and 2 is player 2, with 0 the "any
+                // device" slot the mobile bytecode reads. Sonic 2's Player2Object
+                // polls keyDown[2] to notice a second player picking up a pad, so
+                // slot 2 has to reach the second controller instead of folding
+                // back onto player 1. Every other slot behaves exactly as before.
+                const InputData *kd = &keyDown;
+                const InputData *kp = &keyPress;
+#if !RETRO_USE_ORIGINAL_CODE
+                if (arrayVal == 2) {
+                    kd         = &keyDownP2;
+                    kp         = &keyPressP2;
+                    inputCheck = inputP2Connected;
+                }
+#endif
 #endif
 
                 // Variables
@@ -3994,34 +4009,34 @@ void ProcessScript(int scriptCodeStart, int jumpTableStart, byte scriptEvent)
                     case VAR_MUSICCURRENTTRACK: scriptEng.operands[i] = trackID; break;
                     case VAR_MUSICPOSITION: scriptEng.operands[i] = musicPosition; break;
 #if RETRO_REV03 && !RETRO_USE_ORIGINAL_CODE
-                    case VAR_KEYDOWNUP: scriptEng.operands[i] = keyDown.up && inputCheck; break;
-                    case VAR_KEYDOWNDOWN: scriptEng.operands[i] = keyDown.down && inputCheck; break;
-                    case VAR_KEYDOWNLEFT: scriptEng.operands[i] = keyDown.left && inputCheck; break;
-                    case VAR_KEYDOWNRIGHT: scriptEng.operands[i] = keyDown.right && inputCheck; break;
-                    case VAR_KEYDOWNBUTTONA: scriptEng.operands[i] = keyDown.A && inputCheck; break;
-                    case VAR_KEYDOWNBUTTONB: scriptEng.operands[i] = keyDown.B && inputCheck; break;
-                    case VAR_KEYDOWNBUTTONC: scriptEng.operands[i] = keyDown.C && inputCheck; break;
-                    case VAR_KEYDOWNBUTTONX: scriptEng.operands[i] = keyDown.X && inputCheck; break;
-                    case VAR_KEYDOWNBUTTONY: scriptEng.operands[i] = keyDown.Y && inputCheck; break;
-                    case VAR_KEYDOWNBUTTONZ: scriptEng.operands[i] = keyDown.Z && inputCheck; break;
-                    case VAR_KEYDOWNBUTTONL: scriptEng.operands[i] = keyDown.L && inputCheck; break;
-                    case VAR_KEYDOWNBUTTONR: scriptEng.operands[i] = keyDown.R && inputCheck; break;
-                    case VAR_KEYDOWNSTART: scriptEng.operands[i] = keyDown.start && inputCheck; break;
-                    case VAR_KEYDOWNSELECT: scriptEng.operands[i] = keyDown.select && inputCheck; break;
-                    case VAR_KEYPRESSUP: scriptEng.operands[i] = keyPress.up && inputCheck; break;
-                    case VAR_KEYPRESSDOWN: scriptEng.operands[i] = keyPress.down && inputCheck; break;
-                    case VAR_KEYPRESSLEFT: scriptEng.operands[i] = keyPress.left && inputCheck; break;
-                    case VAR_KEYPRESSRIGHT: scriptEng.operands[i] = keyPress.right && inputCheck; break;
-                    case VAR_KEYPRESSBUTTONA: scriptEng.operands[i] = keyPress.A && inputCheck; break;
-                    case VAR_KEYPRESSBUTTONB: scriptEng.operands[i] = keyPress.B && inputCheck; break;
-                    case VAR_KEYPRESSBUTTONC: scriptEng.operands[i] = keyPress.C && inputCheck; break;
-                    case VAR_KEYPRESSBUTTONX: scriptEng.operands[i] = keyPress.X && inputCheck; break;
-                    case VAR_KEYPRESSBUTTONY: scriptEng.operands[i] = keyPress.Y && inputCheck; break;
-                    case VAR_KEYPRESSBUTTONZ: scriptEng.operands[i] = keyPress.Z && inputCheck; break;
-                    case VAR_KEYPRESSBUTTONL: scriptEng.operands[i] = keyPress.L && inputCheck; break;
-                    case VAR_KEYPRESSBUTTONR: scriptEng.operands[i] = keyPress.R && inputCheck; break;
-                    case VAR_KEYPRESSSTART: scriptEng.operands[i] = keyPress.start && inputCheck; break;
-                    case VAR_KEYPRESSSELECT: scriptEng.operands[i] = keyPress.select && inputCheck; break;
+                    case VAR_KEYDOWNUP: scriptEng.operands[i] = kd->up && inputCheck; break;
+                    case VAR_KEYDOWNDOWN: scriptEng.operands[i] = kd->down && inputCheck; break;
+                    case VAR_KEYDOWNLEFT: scriptEng.operands[i] = kd->left && inputCheck; break;
+                    case VAR_KEYDOWNRIGHT: scriptEng.operands[i] = kd->right && inputCheck; break;
+                    case VAR_KEYDOWNBUTTONA: scriptEng.operands[i] = kd->A && inputCheck; break;
+                    case VAR_KEYDOWNBUTTONB: scriptEng.operands[i] = kd->B && inputCheck; break;
+                    case VAR_KEYDOWNBUTTONC: scriptEng.operands[i] = kd->C && inputCheck; break;
+                    case VAR_KEYDOWNBUTTONX: scriptEng.operands[i] = kd->X && inputCheck; break;
+                    case VAR_KEYDOWNBUTTONY: scriptEng.operands[i] = kd->Y && inputCheck; break;
+                    case VAR_KEYDOWNBUTTONZ: scriptEng.operands[i] = kd->Z && inputCheck; break;
+                    case VAR_KEYDOWNBUTTONL: scriptEng.operands[i] = kd->L && inputCheck; break;
+                    case VAR_KEYDOWNBUTTONR: scriptEng.operands[i] = kd->R && inputCheck; break;
+                    case VAR_KEYDOWNSTART: scriptEng.operands[i] = kd->start && inputCheck; break;
+                    case VAR_KEYDOWNSELECT: scriptEng.operands[i] = kd->select && inputCheck; break;
+                    case VAR_KEYPRESSUP: scriptEng.operands[i] = kp->up && inputCheck; break;
+                    case VAR_KEYPRESSDOWN: scriptEng.operands[i] = kp->down && inputCheck; break;
+                    case VAR_KEYPRESSLEFT: scriptEng.operands[i] = kp->left && inputCheck; break;
+                    case VAR_KEYPRESSRIGHT: scriptEng.operands[i] = kp->right && inputCheck; break;
+                    case VAR_KEYPRESSBUTTONA: scriptEng.operands[i] = kp->A && inputCheck; break;
+                    case VAR_KEYPRESSBUTTONB: scriptEng.operands[i] = kp->B && inputCheck; break;
+                    case VAR_KEYPRESSBUTTONC: scriptEng.operands[i] = kp->C && inputCheck; break;
+                    case VAR_KEYPRESSBUTTONX: scriptEng.operands[i] = kp->X && inputCheck; break;
+                    case VAR_KEYPRESSBUTTONY: scriptEng.operands[i] = kp->Y && inputCheck; break;
+                    case VAR_KEYPRESSBUTTONZ: scriptEng.operands[i] = kp->Z && inputCheck; break;
+                    case VAR_KEYPRESSBUTTONL: scriptEng.operands[i] = kp->L && inputCheck; break;
+                    case VAR_KEYPRESSBUTTONR: scriptEng.operands[i] = kp->R && inputCheck; break;
+                    case VAR_KEYPRESSSTART: scriptEng.operands[i] = kp->start && inputCheck; break;
+                    case VAR_KEYPRESSSELECT: scriptEng.operands[i] = kp->select && inputCheck; break;
 #else
                     case VAR_KEYDOWNUP: scriptEng.operands[i] = keyDown.up; break;
                     case VAR_KEYDOWNDOWN: scriptEng.operands[i] = keyDown.down; break;
@@ -5621,6 +5636,13 @@ void ProcessScript(int scriptCodeStart, int jumpTableStart, byte scriptEvent)
                 // scriptEng.operands[0] = inputSlot
                 // scriptEng.operands[1] = deviceID
 
+                // Nothing to do: slots are wired straight to controller ports
+                // here rather than assigned on demand. Sonic 2 only ever calls
+                // this as AssignInputSlotToDevice(2, -1) - "release player 2's
+                // slot" - and releasing is implicit, because the script has
+                // already pointed p2InputFunction back at the AI and
+                // IsInputSlotAssigned below reports the pad's real presence.
+                opcodeSize = 0;
                 break;
 
             case FUNC_ISSLOTASSIGNED:
@@ -5630,6 +5652,12 @@ void ProcessScript(int scriptCodeStart, int jumpTableStart, byte scriptEvent)
                 // FUNCTION NOTES:
                 // - Sets scriptEng.checkResult
 
+                // Slot 2 is player 2's controller; every other slot is player 1,
+                // which is always present. Player2_Input_GamepadAssist uses this
+                // to hand Tails back to the AI if the second pad is unplugged
+                // mid-stage.
+                opcodeSize            = 0;
+                scriptEng.checkResult = scriptEng.operands[0] == 2 ? inputP2Connected : true;
                 break;
 
             case FUNC_RESETINPUTSLOTASSIGNMENTS:

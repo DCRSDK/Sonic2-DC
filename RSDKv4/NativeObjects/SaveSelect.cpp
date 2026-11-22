@@ -1,4 +1,7 @@
 #include "RetroEngine.hpp"
+#if RETRO_USING_KOS
+#include "Dreamcast/DCSave.hpp"
+#endif
 
 void SaveSelect_Create(void *objPtr)
 {
@@ -526,6 +529,9 @@ void SaveSelect_Main(void *objPtr)
                 saveGame->files[self->selectedButton - 1].emeralds       = 0;
                 saveGame->files[self->selectedButton - 1].specialStageID = 0;
                 WriteSaveRAMData();
+#if RETRO_USING_KOS
+                DC_FlushSaves(); // menu-side write - see SettingsScreen.cpp for why
+#endif
 
                 self->deleteEnabled = false;
                 for (int i = SAVESELECT_BUTTON_SAVE1; i < SAVESELECT_BUTTON_COUNT; ++i) {

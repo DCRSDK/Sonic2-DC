@@ -53,6 +53,7 @@ typedef unsigned int uint;
 // Custom Platforms start here
 #define RETRO_UWP   (7)
 #define RETRO_LINUX (8)
+#define RETRO_DC    (9) // SEGA Dreamcast (KallistiOS)
 
 // Platform types (Game manages platform-specific code such as HUD position using this rather than the above)
 #define RETRO_STANDARD (0)
@@ -87,6 +88,9 @@ typedef unsigned int uint;
 #define RETRO_PLATFORM   (RETRO_ANDROID)
 #define RETRO_DEVICETYPE (RETRO_MOBILE)
 #include <jni.h>
+#elif defined(_arch_dreamcast)
+#define RETRO_PLATFORM   (RETRO_DC)
+#define RETRO_DEVICETYPE (RETRO_STANDARD)
 #elif defined(__linux__)
 #define RETRO_PLATFORM   (RETRO_LINUX)
 #define RETRO_DEVICETYPE (RETRO_STANDARD)
@@ -96,17 +100,32 @@ typedef unsigned int uint;
 #define RETRO_DEVICETYPE (RETRO_STANDARD)
 #endif
 
+#if RETRO_PLATFORM == RETRO_DC
+// Native Dreamcast video mode is 320x240; keeps the software renderer fast
+// and lets us DMA the framebuffer straight to VRAM.
+#define DEFAULT_SCREEN_XSIZE 320
+#define DEFAULT_FULLSCREEN   true
+#else
 #define DEFAULT_SCREEN_XSIZE 424
 #define DEFAULT_FULLSCREEN   false
 #define RETRO_USING_MOUSE
 #define RETRO_USING_TOUCH
+#endif
 
 #ifndef BASE_PATH
 #define BASE_PATH ""
 #endif
 
+#if RETRO_PLATFORM == RETRO_DC
+// KallistiOS backend: no SDL at all
+#undef RETRO_USE_SDL2
+#undef RETRO_USE_SDL1
+#define RETRO_USING_KOS (1)
+#else
+#define RETRO_USING_KOS (0)
 #if !defined(RETRO_USE_SDL2) && !defined(RETRO_USE_SDL1)
 #define RETRO_USE_SDL2 (1)
+#endif
 #endif
 
 #if RETRO_PLATFORM == RETRO_WIN || RETRO_PLATFORM == RETRO_OSX || RETRO_PLATFORM == RETRO_LINUX || RETRO_PLATFORM == RETRO_UWP                       \
@@ -140,6 +159,11 @@ typedef unsigned int uint;
 #define RETRO_RENDERTYPE (RETRO_HW_RENDER)
 #elif !defined(RETRO_RENDERTYPE)
 #define RETRO_RENDERTYPE (RETRO_SW_RENDER)
+#endif
+
+#if RETRO_PLATFORM == RETRO_DC
+#undef RETRO_USING_OPENGL
+#define RETRO_USING_OPENGL (0)
 #endif
 
 #ifndef RETRO_USING_OPENGL
@@ -202,7 +226,11 @@ typedef unsigned int uint;
 #endif
 #endif
 
+#if RETRO_PLATFORM == RETRO_DC
+#define RETRO_USE_HAPTICS (0)
+#else
 #define RETRO_USE_HAPTICS (1)
+#endif
 
 // NOTE: This is only used for rev00 stuff, it was removed in rev01 and later builds
 #if RETRO_PLATFORM <= RETRO_WP7
@@ -210,7 +238,7 @@ typedef unsigned int uint;
 #else
 
 // use *this* macro to determine what platform the game thinks its running on (since only the first 7 platforms are supported natively by scripts)
-#if RETRO_PLATFORM == RETRO_LINUX
+#if RETRO_PLATFORM == RETRO_LINUX || RETRO_PLATFORM == RETRO_DC
 #define RETRO_GAMEPLATFORMID (RETRO_WIN)
 #elif RETRO_PLATFORM == RETRO_UWP
 #define RETRO_GAMEPLATFORMID (UAP_GetRetroGamePlatformId())
@@ -308,8 +336,43 @@ enum RetroGameType {
 #elif RETRO_USING_SDL2
 #include <SDL2/SDL.h>
 #include <vorbis/vorbisfile.h>
+#elif RETRO_PLATFORM == RETRO_DC
+#include <kos.h>
+// NO VORBIS HEADER HERE, DELIBERATELY.
+//
+// The Dreamcast build decodes no Vorbis at all. Music is raw PCM streamed by
+// DC_MusicOpen, and the global sound effects are raw PCM loaded by
+// DC_LoadRawSfx (both in DCAudio.cpp) from loose files that keep their .ogg
+// names so GameConfig.bin still resolves them. Stage sfx are PCM .wav going
+// to AICA sound RAM. Nothing is left to decode.
+//
+// That is what lets libtremor and libogg leave the kos-ports prerequisites
+// entirely. Everything that referenced the vorbis API on this platform is now
+// behind `#if !RETRO_USING_KOS`: StreamInfo::vorbisFile (Audio.hpp), the four
+// readVorbis/seekVorbis/tellVorbis/closeVorbis callbacks, and LoadMusic's
+// tail after its KOS early return (both in Audio.cpp). If you reinstate this
+// include you must unwind those too, or the linker will start asking for
+// ov_* symbols again.
+//
+// A packed Vorbis sfx with no loose raw copy is now simply not loaded, and
+// says so in the log rather than failing silently.
+
+// SDL-style fixed-width types used throughout the engine
+typedef int8_t Sint8;
+typedef uint8_t Uint8;
+typedef int16_t Sint16;
+typedef uint16_t Uint16;
+typedef int32_t Sint32;
+typedef uint32_t Uint32;
+typedef int64_t Sint64;
+typedef uint64_t Uint64;
+
 #else
 
+#endif
+
+#if !RETRO_USING_KOS && !defined(OV_READ)
+#define OV_READ(vf, buf, len, bs) ov_read(vf, buf, len, 0, 2, 1, bs)
 #endif
 
 #if !RETRO_USE_ORIGINAL_CODE
@@ -370,7 +433,9 @@ public:
     bool usingOrigins = false;
 #endif
 
-    char dataFile[RETRO_PACKFILE_COUNT][0x80];
+    // Only RETRO_PACK_COUNT (4) data packs are ever addressed; sizing this
+    // by RETRO_PACKFILE_COUNT (0x1000) wasted 512KB of BSS.
+    char dataFile[RETRO_PACK_COUNT][0x80];
 
     bool initialised = false;
     bool running     = false;

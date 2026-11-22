@@ -1,7 +1,44 @@
 #include "RetroEngine.hpp"
 
+#if RETRO_USING_KOS
+#include "Dreamcast/DCCommon.hpp"
+#endif
+
 InputData keyPress = InputData();
 InputData keyDown  = InputData();
+
+#if !RETRO_USE_ORIGINAL_CODE
+InputButton inputDeviceP2[INPUT_BUTTONCOUNT];
+InputData keyPressP2   = InputData();
+InputData keyDownP2    = InputData();
+bool inputP2Connected  = false;
+
+// Collapse an InputButton array into the InputData pair the rest of the engine
+// reads. Mirrors CheckKeyDown/CheckKeyPress, which do the same for player 1.
+static void SnapshotInputDevice(const InputButton *dev, InputData *down, InputData *press)
+{
+#define RSDK_SNAP(field, id)                                                                                                               \
+    down->field  = dev[id].hold;                                                                                                           \
+    press->field = dev[id].press;
+
+    RSDK_SNAP(up, INPUT_UP)
+    RSDK_SNAP(down, INPUT_DOWN)
+    RSDK_SNAP(left, INPUT_LEFT)
+    RSDK_SNAP(right, INPUT_RIGHT)
+    RSDK_SNAP(A, INPUT_BUTTONA)
+    RSDK_SNAP(B, INPUT_BUTTONB)
+    RSDK_SNAP(C, INPUT_BUTTONC)
+    RSDK_SNAP(X, INPUT_BUTTONX)
+    RSDK_SNAP(Y, INPUT_BUTTONY)
+    RSDK_SNAP(Z, INPUT_BUTTONZ)
+    RSDK_SNAP(L, INPUT_BUTTONL)
+    RSDK_SNAP(R, INPUT_BUTTONR)
+    RSDK_SNAP(start, INPUT_START)
+    RSDK_SNAP(select, INPUT_SELECT)
+
+#undef RSDK_SNAP
+}
+#endif
 
 int touchDown[8];
 int touchX[8];
@@ -248,23 +285,19 @@ void controllerClose(int controllerID)
     SDL_GameController *controller = SDL_GameControllerFromInstanceID(controllerID);
     if (controller) {
         SDL_GameControllerClose(controller);
-#endif
         if (controllers.size() == 1) {
             controllers.clear();
         } else {
             for (int i = 0; i < controllers.size(); ++i) {
                 if (controllers[i].index == controllerID) {
                     controllers.erase(controllers.begin() + i);
-#if RETRO_USING_SDL2
                     if (controllers[i].hapticPtr) {
                         SDL_HapticClose(controllers[i].hapticPtr);
                     }
-#endif
                     break;
                 }
             }
         }
-#if RETRO_USING_SDL2
     }
 #endif
 
@@ -323,6 +356,22 @@ void ReleaseInputDevices()
 
 void ProcessInput()
 {
+#if RETRO_USING_KOS
+    DC_ProcessInput();
+
+#if !RETRO_USE_ORIGINAL_CODE
+    // Once per frame, before any script runs.
+    SnapshotInputDevice(inputDeviceP2, &keyDownP2, &keyPressP2);
+#endif
+
+    if (inputDevice[INPUT_ANY].press || inputDevice[INPUT_ANY].hold || touches > 1) {
+        Engine.dimTimer = 0;
+    }
+    else if (Engine.dimTimer < Engine.dimLimit && !Engine.masterPaused) {
+        ++Engine.dimTimer;
+    }
+    return;
+#endif
 #if RETRO_USING_SDL2
     int length           = 0;
     const byte *keyState = SDL_GetKeyboardState(&length);

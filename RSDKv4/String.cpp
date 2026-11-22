@@ -239,6 +239,165 @@ void GenerateMD5FromString(const char *string, int len, uint *hash0, uint *hash1
     }
 }
 
+#include <stdlib.h> // malloc/free for the StringList cache below
+
+// StringList cache state. Declared unconditionally so ReadLocalizedString can
+// stay a single function; off-KOS the cache is never armed and every one of
+// these stays at its initial value.
+static byte *slCache            = NULL;
+static int   slCacheLen         = 0;
+static int   slCachePos         = 0;
+static bool  slUsingCache       = false;
+static char  slCachePath[0x100] = { 0 };
+
+#if RETRO_USING_KOS
+// ---------------------------------------------------------------------------
+// GD-ROM: read StringList.txt once instead of ~100 times.
+//
+// InitLocalizedStrings() below asks ReadLocalizedString() for about a hundred
+// strings, and every one of those calls does a full LoadFile() - which on KOS
+// means fopen() re-walking the ISO directory tree through the inode cache,
+// then a linear scan from byte zero of a UTF-16 file looking for one token.
+// Averaged over the file that is on the order of a couple of megabytes read to
+// extract a few kilobytes of text, and, worse, a hundred separate opens.
+//
+// Each of those is expensive out of proportion to its size. bread_cache()
+// calls iso_abort_stream() on every cache miss and iso_seek() aborts on every
+// position change, and there is only one stream_fd for the whole filesystem -
+// so each open/seek/scan tears down whatever sequential read-ahead the drive
+// had going, including the music the DCAudio.cpp reader thread is streaming.
+//
+// So: pull the file into RAM once, and let the same parser walk memory. The
+// cache is keyed on the path and is only ever armed around the block of calls
+// in InitLocalizedStrings(), so any other caller - and every caller at all if
+// the allocation fails - takes exactly the path it takes today.
+// ---------------------------------------------------------------------------
+// StringList.txt is UTF-16 and a few tens of KB; the cap is only here so a
+// corrupt header can't turn into a multi-megabyte allocation.
+#define SL_CACHE_MAX (512 * 1024)
+
+static void ReleaseStringListCache()
+{
+    if (slCache)
+        free(slCache);
+
+    slCache      = NULL;
+    slCacheLen   = 0;
+    slCachePos   = 0;
+    slUsingCache = false;
+    slCachePath[0] = 0;
+}
+
+static void LoadStringListCache(const char *filePath)
+{
+    ReleaseStringListCache();
+
+    FileInfo info;
+    if (!LoadFile(filePath, &info))
+        return; // ReadLocalizedString will report the failure per-string, as before
+
+    int len = info.vfileSize;
+    if (len <= 0 || len > SL_CACHE_MAX) {
+        CloseFile();
+        return;
+    }
+
+    byte *buf = (byte *)malloc((size_t)len);
+    if (!buf) {
+        CloseFile();
+        return; // not fatal - just fall back to reading it per string
+    }
+
+    // One FileRead for the whole file. This is byte-identical to the many small
+    // reads it replaces even for an encrypted entry in Data.rsdk, because the
+    // keystream in FileRead() advances strictly per byte consumed.
+    FileRead(buf, len);
+    CloseFile();
+
+    slCache    = buf;
+    slCacheLen = len;
+    slCachePos = 0;
+    StrCopy(slCachePath, filePath);
+}
+
+static inline bool SL_CacheCovers(const char *filePath) { return slCache && StrComp(slCachePath, filePath); }
+
+// The three primitives ReadLocalizedString's state machine actually uses. Each
+// serves RAM when the cache is armed and otherwise calls straight through, so
+// the uncached path is unchanged.
+static inline bool SL_Eof() { return slUsingCache ? (slCachePos >= slCacheLen) : ReachedEndOfFile(); }
+
+static inline ushort SL_ReadChar()
+{
+    if (!slUsingCache) {
+        FileRead(fileBuffer, sizeof(ushort));
+        return fileBuffer[0] + (fileBuffer[1] << 8);
+    }
+
+    if (slCachePos + 1 >= slCacheLen) {
+        slCachePos = slCacheLen;
+        return 0;
+    }
+
+    ushort curChar = slCache[slCachePos] + (slCache[slCachePos + 1] << 8);
+    slCachePos += 2;
+    return curChar;
+}
+
+// Mirror of ReadStringLineUnicode() in String.hpp - keep the two in step if
+// that one ever changes.
+static inline void SL_ReadLineUnicode(ushort *text)
+{
+    if (!slUsingCache) {
+        ReadStringLineUnicode(text);
+        return;
+    }
+
+    bool lineEnding;
+    ushort curChar = 0;
+
+    int textPos = 0;
+    while (true) {
+        curChar    = SL_ReadChar();
+        lineEnding = false;
+
+        switch (curChar) {
+            case '\t':
+            case ' ': break;
+
+            case '\n':
+            case '\r':
+                lineEnding    = true;
+                text[textPos] = 0;
+                break;
+
+            case ';': break;
+
+            default: text[textPos++] = curChar; break;
+        }
+
+        if (SL_Eof()) {
+            text[textPos] = 0;
+            return;
+        }
+
+        if (lineEnding)
+            return;
+    }
+}
+#else
+#define SL_CacheCovers(path)      (false)
+#define LoadStringListCache(path) ((void)0)
+#define ReleaseStringListCache()  ((void)0)
+#define SL_Eof()                  ReachedEndOfFile()
+#define SL_ReadLineUnicode(text)  ReadStringLineUnicode(text)
+static inline ushort SL_ReadChar()
+{
+    FileRead(fileBuffer, sizeof(ushort));
+    return fileBuffer[0] + (fileBuffer[1] << 8);
+}
+#endif
+
 void InitLocalizedStrings()
 {
     memset(stringStorage, 0, STRING_SIZE * STRSTORAGE_SIZE * sizeof(ushort));
@@ -259,6 +418,9 @@ void InitLocalizedStrings()
         case RETRO_ZS: StrCopy(langStr, "zs"); break;
         default: break;
     }
+    // Everything below reads the same file; hold it in RAM for the duration.
+    LoadStringListCache("Data/Game/StringList.txt");
+
     strPressStart     = ReadLocalizedString("PressStart", langStr, "Data/Game/StringList.txt");
     strTouchToStart   = ReadLocalizedString("TouchToStart", langStr, "Data/Game/StringList.txt");
     strStartGame      = ReadLocalizedString("StartGame", langStr, "Data/Game/StringList.txt");
@@ -360,6 +522,8 @@ void InitLocalizedStrings()
     // strSwipeAndTap   = ReadLocalizedString("SwipeAndTap", langStr, "Data/Game/StringList.txt");
     // strVirtualDPad   = ReadLocalizedString("VirtualDPad", langStr, "Data/Game/StringList.txt");
 
+    ReleaseStringListCache();
+
     ReadCreditsList("Data/Game/CreditsMobile.txt");
 }
 ushort *ReadLocalizedString(const char *stringName, const char *language, const char *filePath)
@@ -392,15 +556,23 @@ ushort *ReadLocalizedString(const char *stringName, const char *language, const 
     langName[langNamePos++] = ':';
     langName[langNamePos]   = 0;
 
-    if (LoadFile(filePath, &info)) {
+    // Serve from the cache when it holds this exact file; otherwise open it, so
+    // callers outside InitLocalizedStrings behave exactly as they did before.
+    const bool useCache = SL_CacheCovers(filePath);
+    if (useCache) {
+        slCachePos   = 0;
+        slUsingCache = true;
+    }
+
+    if (useCache || LoadFile(filePath, &info)) {
         int readMode   = 0;
         ushort curChar = 0;
         int charID     = 0;
         byte flag      = 0;
-        while (!ReachedEndOfFile()) {
+        while (!SL_Eof()) {
             switch (readMode) {
                 case 0:
-                    ReadStringLineUnicode(lineBuffer);
+                    SL_ReadLineUnicode(lineBuffer);
                     if (!FindStringTokenUnicode(lineBuffer, langName, 1)) {
                         int tPos = FindStringTokenUnicode(lineBuffer, strName, 1);
                         if (tPos == 3)
@@ -409,11 +581,12 @@ ushort *ReadLocalizedString(const char *stringName, const char *language, const 
                     }
                     break;
                 case 1:
-                    FileRead(fileBuffer, sizeof(ushort));
-                    curChar = fileBuffer[0] + (fileBuffer[1] << 8);
+                    curChar = SL_ReadChar();
                     if (curChar > '\n' && curChar != '\r') {
                         stringStorage[stringStorePos + charID++] = 0;
-                        CloseFile();
+                        if (!useCache)
+                            CloseFile();
+                        slUsingCache = false;
 
                         int pos = stringStorePos;
                         stringStorePos += charID;
@@ -431,8 +604,7 @@ ushort *ReadLocalizedString(const char *stringName, const char *language, const 
                     }
                     break;
                 case 2:
-                    FileRead(fileBuffer, sizeof(ushort));
-                    curChar = fileBuffer[0] + (fileBuffer[1] << 8);
+                    curChar = SL_ReadChar();
                     if (curChar != '\t') {
                         stringStorage[stringStorePos + charID++] = curChar;
                         if (curChar == '\r' || curChar == '\n') {
@@ -443,9 +615,11 @@ ushort *ReadLocalizedString(const char *stringName, const char *language, const 
                     break;
             }
         }
-        CloseFile();
+        if (!useCache)
+            CloseFile();
     }
 
+    slUsingCache = false;
     PrintLog("Failed to load string... (%s, %s)", language, stringName);
     return NULL;
 }
