@@ -6,7 +6,7 @@ A Sonic 2/RSDKv4 port for SEGA Dreamcast based on the RSDKv4 Decompilation, usin
 + Requires ffmpeg and Python 3 (with Pillow and NumPy) for asset generation, as well as an existing KallistiOS and mkdcdisc install for compiling the .elf and building the CDI.
 + Compatible with GCC 14.4.1 / KOS 2.3.0, or GCC 14.3.0 / KOS 2.2.2. Build with anything else at your own risk.
 + Build in Linux or MacOS environments, or Windows via DreamSDK or WSL (Debian or Ubuntu based preferably)
-+ Build from your own KallistiOS setup by cloning this git and following the instructions in BUILD_DREAMCAST.md or use the autobuilder [HERE]([https://colab.research.google.com/drive/181YZAGsc0v9GoGwJRG-voBABzgG49czq#scrollTo=pONz2n4coJ3Q)
++ Build from your own KallistiOS setup by cloning this git and following the instructions in BUILD_DREAMCAST.md or use the autobuilder [HERE](https://colab.research.google.com/drive/181YZAGsc0v9GoGwJRG-voBABzgG49czq#scrollTo=pONz2n4coJ3Q)
 + Bring your own Sonic 2 Data.rsdk (MUST be the 2013 mobile remaster; Origins is untested and presumed unsupported).
 
 NO ASSETS ARE PROVIDED IN THIS RELEASE.
